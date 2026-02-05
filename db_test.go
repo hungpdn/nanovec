@@ -1,4 +1,4 @@
-package nanovec
+package nanovec_test
 
 import (
 	"math"
@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	"github.com/hungpdn/nanovec"
 )
 
 // Helper to assert errors
@@ -28,11 +30,11 @@ func TestCrashRecovery(t *testing.T) {
 	// 1. Setup: Create a temporary directory (Go 1.15+ standard way)
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "crash_db_std")
-	cfg := &Config{Dimension: 3}
+	cfg := &nanovec.Config{Dimension: 3}
 
 	// 2. Insert Data
 	func() {
-		db, err := Open(dbPath, cfg)
+		db, err := nanovec.Open(dbPath, cfg)
 		assertNoError(t, err, "Failed to open DB for setup")
 		defer db.Close()
 
@@ -65,7 +67,7 @@ func TestCrashRecovery(t *testing.T) {
 
 	// 4. Recovery: Re-open the DB
 	// It should detect the missing index and rebuild it from storage.
-	db, err := Open(dbPath, cfg)
+	db, err := nanovec.Open(dbPath, cfg)
 	assertNoError(t, err, "Failed to re-open DB during recovery")
 	defer db.Close()
 

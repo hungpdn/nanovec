@@ -17,7 +17,6 @@ import (
 // FlatIndex: Save all vectors in Map and iterate through them during the search
 type FlatIndex struct {
 	mu sync.RWMutex
-	// Data in RAM (Optimized for SIMD)
 	// Example: There are 2 2D vectors [1,2] and [3,4]
 	// RawVectors = [1, 2, 3, 4] -> 100% seamless
 	RawVectors []float32
