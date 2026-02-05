@@ -125,28 +125,23 @@ func (db *DB) Insert(id string, vec []float32, meta map[string]any) error {
 		return errors.ErrDimMismatch
 	}
 
-	doc := &types.Document{
-		ID:       id,
-		Vector:   types.Vector(vec),
-		Metadata: meta,
-	}
+	doc := &types.Document{ID: id, Vector: types.Vector(vec), Metadata: meta}
 
-	if err := db.storage.Put(doc); err != nil {
+	newVer, err := db.storage.Put(doc)
+	if err != nil {
 		return fmt.Errorf("storage write failed: %v", err)
 	}
 
 	_ = db.index.Delete(id)
 	if err := db.index.Add(id, types.Vector(vec), meta); err != nil {
-		return fmt.Errorf("critical: memory index update failed (data saved on disk): %v", err)
+		return fmt.Errorf("critical: memory index update failed: %v", err)
 	}
 
-	newVer, _ := db.storage.GetVersion()
 	db.index.SetVersion(newVer)
-
 	return nil
 }
 
-// InsertBatch adds multiple vectors efficiently
+// InsertBatch adds multiple vectors
 func (db *DB) InsertBatch(ids []string, vecs [][]float32, metas []map[string]any) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -163,14 +158,11 @@ func (db *DB) InsertBatch(ids []string, vecs [][]float32, metas []map[string]any
 			return errors.ErrDimMismatch
 		}
 		typeVectors[i] = types.Vector(vecs[i])
-		docs[i] = &types.Document{
-			ID:       id,
-			Vector:   typeVectors[i],
-			Metadata: metas[i],
-		}
+		docs[i] = &types.Document{ID: id, Vector: typeVectors[i], Metadata: metas[i]}
 	}
 
-	if err := db.storage.PutBatch(docs); err != nil {
+	newVer, err := db.storage.PutBatch(docs)
+	if err != nil {
 		return fmt.Errorf("storage batch write failed: %v", err)
 	}
 
@@ -184,11 +176,7 @@ func (db *DB) InsertBatch(ids []string, vecs [][]float32, metas []map[string]any
 		return fmt.Errorf("index batch update failed: %v", err)
 	}
 
-	newVer, err := db.storage.GetVersion()
-	if err == nil {
-		db.index.SetVersion(newVer)
-	}
-
+	db.index.SetVersion(newVer)
 	return nil
 }
 
@@ -226,22 +214,19 @@ func (db *DB) Update(id string, newVec []float32, newMeta map[string]any) error 
 		finalMeta = newMeta
 	}
 
-	newDoc := &types.Document{
-		ID:       id,
-		Vector:   finalVec,
-		Metadata: finalMeta,
-	}
+	newDoc := &types.Document{ID: id, Vector: finalVec, Metadata: finalMeta}
 
-	if err := db.storage.Put(newDoc); err != nil {
+	newVer, err := db.storage.Put(newDoc)
+	if err != nil {
 		return err
 	}
 
 	_ = db.index.Delete(id)
 	if err := db.index.Add(id, finalVec, finalMeta); err != nil {
-		_ = db.storage.Put(oldDoc) // Rollback to old doc
 		return fmt.Errorf("index update failed: %v", err)
 	}
 
+	db.index.SetVersion(newVer)
 	return nil
 }
 
@@ -250,12 +235,15 @@ func (db *DB) Delete(id string) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	if err := db.storage.Delete(id); err != nil {
+	newVer, err := db.storage.Delete(id)
+	if err != nil {
 		return err
 	}
 	if err := db.index.Delete(id); err != nil {
 		return err
 	}
+
+	db.index.SetVersion(newVer)
 	return nil
 }
 

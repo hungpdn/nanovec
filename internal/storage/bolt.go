@@ -141,21 +141,21 @@ func (s *BoltStorage) GetVersion() (uint64, error) {
 }
 
 // incVersion increments the database version
-func (s *BoltStorage) incVersion(tx *bbolt.Tx) error {
+func (s *BoltStorage) incVersion(tx *bbolt.Tx) (uint64, error) {
 	b := tx.Bucket([]byte(bucketMeta))
 	seq, _ := b.NextSequence()
 	buf := make([]byte, 8)
 	binary.LittleEndian.PutUint64(buf, seq)
-	return b.Put([]byte(keyDbVersion), buf)
+	return seq, b.Put([]byte(keyDbVersion), buf)
 }
 
-// Put saves document to disk (Upsert)
-func (s *BoltStorage) Put(doc *types.Document) error {
-	return s.db.Update(func(tx *bbolt.Tx) error {
+// Put saves document to disk (Upsert) AND returns the new Version
+func (s *BoltStorage) Put(doc *types.Document) (uint64, error) {
+	var newSeq uint64
+	err := s.db.Update(func(tx *bbolt.Tx) error {
 		bDocs := tx.Bucket([]byte(bucketDocuments))
 		bMeta := tx.Bucket([]byte(bucketMeta))
 
-		// Check existence for count
 		if bDocs.Get([]byte(doc.ID)) == nil {
 			if err := s.incrementCount(bMeta, 1); err != nil {
 				return err
@@ -171,13 +171,17 @@ func (s *BoltStorage) Put(doc *types.Document) error {
 			return err
 		}
 
-		return s.incVersion(tx)
+		newSeq, err = s.incVersion(tx)
+		return err
 	})
+
+	return newSeq, err
 }
 
-// PutBatch saves multiple documents
-func (s *BoltStorage) PutBatch(docs []*types.Document) error {
-	return s.db.Update(func(tx *bbolt.Tx) error {
+// PutBatch saves multiple documents AND returns the new Version
+func (s *BoltStorage) PutBatch(docs []*types.Document) (uint64, error) {
+	var newSeq uint64
+	err := s.db.Update(func(tx *bbolt.Tx) error {
 		bDocs := tx.Bucket([]byte(bucketDocuments))
 		bMeta := tx.Bucket([]byte(bucketMeta))
 
@@ -206,17 +210,18 @@ func (s *BoltStorage) PutBatch(docs []*types.Document) error {
 			}
 		}
 
-		if err := s.incVersion(tx); err != nil {
-			return err
-		}
-
 		if newItems > 0 {
 			if err := s.incrementCount(bMeta, newItems); err != nil {
 				return err
 			}
 		}
-		return nil
+
+		var err error
+		newSeq, err = s.incVersion(tx)
+		return err
 	})
+
+	return newSeq, err
 }
 
 // Get read document from disk
@@ -247,19 +252,32 @@ func (s *BoltStorage) Get(id string) (*types.Document, error) {
 }
 
 // Delete remove document
-func (s *BoltStorage) Delete(id string) error {
-	return s.db.Update(func(tx *bbolt.Tx) error {
+func (s *BoltStorage) Delete(id string) (uint64, error) {
+	var newSeq uint64
+	err := s.db.Update(func(tx *bbolt.Tx) error {
 		bDocs := tx.Bucket([]byte(bucketDocuments))
 		bMeta := tx.Bucket([]byte(bucketMeta))
 
-		if bDocs.Get([]byte(id)) != nil {
-			if err := s.decrementCount(bMeta, 1); err != nil {
-				return err
+		if bDocs.Get([]byte(id)) == nil {
+			val := bMeta.Get([]byte(keyDbVersion))
+			if val != nil {
+				newSeq = binary.LittleEndian.Uint64(val)
 			}
-			return bDocs.Delete([]byte(id))
+			return nil
 		}
-		return nil
+
+		if err := s.decrementCount(bMeta, 1); err != nil {
+			return err
+		}
+		if err := bDocs.Delete([]byte(id)); err != nil {
+			return err
+		}
+		var err error
+		newSeq, err = s.incVersion(tx)
+		return err
 	})
+
+	return newSeq, err
 }
 
 // Scan iterates over all documents

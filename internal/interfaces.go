@@ -20,10 +20,12 @@ type VectorIndex interface {
 
 // Storage: Interface for persistent storage
 type Storage interface {
-	Put(doc *types.Document) error // Upsert
-	PutBatch(docs []*types.Document) error
+	// Put inserts a document and returns the new DB Version (Atomic)
+	Put(doc *types.Document) (uint64, error)
+	// PutBatch inserts multiple documents and returns the new DB Version
+	PutBatch(docs []*types.Document) (uint64, error)
 	Get(id string) (*types.Document, error)
-	Delete(id string) error
+	Delete(id string) (uint64, error)
 	Scan(fn func(doc *types.Document) error) error
 	Has(id string) bool
 	Count() (int, error)
