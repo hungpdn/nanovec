@@ -84,9 +84,21 @@ func Open(path string, cfg *Config) (*DB, error) {
 	}
 
 	idxVer := idx.GetVersion()
+	needRebuild := false
 
+	docCount, err := store.Count()
+	if err != nil {
+		return nil, fmt.Errorf("failed to count storage docs: %v", err)
+	}
+	if docCount == 0 && !indexLoaded {
+		idx.SetVersion(storeVer)
+		if err := idx.Save(indexPath); err != nil {
+			log.Printf("⚠️ Warning: Failed to init empty index file: %v", err)
+		}
+		goto final
+	}
 	// Self-Healing
-	needRebuild := !indexLoaded || (idxVer != storeVer)
+	needRebuild = !indexLoaded || (idxVer != storeVer)
 	if needRebuild {
 		if count, _ := store.Count(); count > 0 {
 			// Scan 1 document to peek dimension
@@ -152,6 +164,7 @@ func Open(path string, cfg *Config) (*DB, error) {
 		log.Printf("✅ Restored %d vectors in %v. System is consistent.", count, time.Since(start))
 	}
 
+final:
 	return &DB{
 		path:    path,
 		config:  finalConfig,
@@ -398,4 +411,11 @@ func (db *DB) Vacuum() error {
 
 	log.Printf("✅ VACUUM completed in %v. Index optimized (Items: %d).", time.Since(start), count)
 	return nil
+}
+
+// Count returns the total number of documents in the database
+func (db *DB) Count() (int, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.storage.Count()
 }
