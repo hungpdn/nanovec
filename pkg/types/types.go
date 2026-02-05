@@ -1,5 +1,10 @@
 package types
 
+const (
+	KB = 1024    // 1 Kilobyte
+	MB = KB * KB // 1 Megabyte
+)
+
 // Number constraint for vector elements (Float32 or Uint8)
 type Number interface {
 	float32 | uint8

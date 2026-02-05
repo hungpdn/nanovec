@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/hungpdn/nanovec/internal"
+	"github.com/hungpdn/nanovec/internal/index"
 	"github.com/hungpdn/nanovec/internal/storage"
 	"github.com/hungpdn/nanovec/pkg/errors"
 	"github.com/hungpdn/nanovec/pkg/maths"
@@ -44,6 +45,7 @@ func Open(path string, cfg *Config) (*DB, error) {
 
 	idx := cfg.GetVectorIndex()
 	indexPath := path + ".idx"
+
 	err = idx.Load(indexPath)
 	if err != nil {
 		// If load fails, we will rebuild
@@ -51,8 +53,31 @@ func Open(path string, cfg *Config) (*DB, error) {
 	}
 	indexLoaded := err == nil
 
-	if indexLoaded && idx.Dim() != cfg.Dimension {
-		cfg.Dimension = idx.Dim()
+	if indexLoaded {
+
+		if idx.Dim() != cfg.Dimension {
+			cfg.Dimension = idx.Dim()
+		}
+
+		if hnsw, ok := idx.(*index.HNSWIndex[float32]); ok {
+			if cfg.M != hnsw.M {
+				log.Printf("ℹ️ Syncing Config M: %d -> %d (from disk)", cfg.M, hnsw.M)
+				cfg.M = hnsw.M
+			}
+			if cfg.EfConstruction != hnsw.EfConstruction {
+				cfg.EfConstruction = hnsw.EfConstruction
+			}
+		}
+
+		if hnsw, ok := idx.(*index.HNSWIndex[uint8]); ok {
+			if cfg.M != hnsw.M {
+				log.Printf("ℹ️ Syncing Config M: %d -> %d (from disk)", cfg.M, hnsw.M)
+				cfg.M = hnsw.M
+			}
+			if cfg.EfConstruction != hnsw.EfConstruction {
+				cfg.EfConstruction = hnsw.EfConstruction
+			}
+		}
 	}
 
 	storeVer, err := store.GetVersion()

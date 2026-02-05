@@ -225,9 +225,10 @@ func (idx *HNSWIndex[T]) AddBatch(ids []string, vecs []types.Vector, metas []map
 
 	for i := 0; i < count; i++ {
 		wg.Add(1)
+		sem <- struct{}{}
+
 		go func(i int) {
 			defer wg.Done()
-			sem <- struct{}{}
 			defer func() { <-sem }()
 
 			node := newNodes[i]
@@ -632,8 +633,19 @@ func (idx *HNSWIndex[T]) Save(path string) error {
 			}
 		}
 
-		if err := binary.Write(f, binary.LittleEndian, node.Vec); err != nil {
-			return err
+		switch v := any(node.Vec).(type) {
+		case []float32:
+			if err := binary.Write(f, binary.LittleEndian, v); err != nil {
+				return err
+			}
+		case []uint8:
+			if _, err := f.Write(v); err != nil {
+				return err
+			}
+		default:
+			if err := binary.Write(f, binary.LittleEndian, node.Vec); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -659,6 +671,12 @@ func (idx *HNSWIndex[T]) Load(path string) error {
 		return err
 	}
 	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	fileSize := fi.Size()
 
 	dec := gob.NewDecoder(f)
 	if err := dec.Decode(&idx.Version); err != nil {
@@ -689,6 +707,21 @@ func (idx *HNSWIndex[T]) Load(path string) error {
 		return err
 	}
 
+	if count < 0 {
+		return fmt.Errorf("corrupted file: negative node count %d", count)
+	}
+
+	if count > 100_000_000 {
+		return fmt.Errorf("node count exceeds limit")
+	}
+
+	minBytesPerNode := int64(12 + idx.dim)
+	minRequiredSize := int64(count) * minBytesPerNode
+	if fileSize < minRequiredSize {
+		return fmt.Errorf("corrupted file: node count %d requires at least %d bytes, but file is only %d bytes",
+			count, minRequiredSize, fileSize)
+	}
+
 	idx.nodes = make([]*Node[T], count)
 	idx.idMap = make(map[string]int)
 
@@ -696,6 +729,10 @@ func (idx *HNSWIndex[T]) Load(path string) error {
 		var idLen int32
 		if err := binary.Read(f, binary.LittleEndian, &idLen); err != nil {
 			return err
+		}
+
+		if idLen < 0 || idLen > types.KB {
+			return fmt.Errorf("corrupted file: invalid id length %d at index %d", idLen, i)
 		}
 
 		idBytes := make([]byte, idLen)
@@ -714,6 +751,10 @@ func (idx *HNSWIndex[T]) Load(path string) error {
 			return err
 		}
 
+		if numLayers < 0 || numLayers > 100 {
+			return fmt.Errorf("corrupted file: invalid numLayers %d at index %d", numLayers, i)
+		}
+
 		neighbors := make([][]int, numLayers)
 		for l := 0; l < int(numLayers); l++ {
 			var layerCount int32
@@ -721,12 +762,16 @@ func (idx *HNSWIndex[T]) Load(path string) error {
 				return err
 			}
 
+			// Check Layer Count sanity (cannot be much greater than MMax0)
+			if layerCount < 0 || layerCount > 10000 {
+				return fmt.Errorf("corrupted file: invalid layerCount %d at index %d layer %d", layerCount, i, l)
+			}
+
 			layerInt32 := make([]int32, layerCount)
 			if err := binary.Read(f, binary.LittleEndian, &layerInt32); err != nil {
 				return err
 			}
 
-			// Convert back to int
 			layer := make([]int, layerCount)
 			for k, v := range layerInt32 {
 				layer[k] = int(v)
@@ -735,8 +780,19 @@ func (idx *HNSWIndex[T]) Load(path string) error {
 		}
 
 		vec := make([]T, idx.dim)
-		if err := binary.Read(f, binary.LittleEndian, &vec); err != nil {
-			return err
+		switch v := any(vec).(type) {
+		case []float32:
+			if err := binary.Read(f, binary.LittleEndian, v); err != nil {
+				return err
+			}
+		case []uint8:
+			if _, err := f.Read(v); err != nil {
+				return err
+			}
+		default:
+			if err := binary.Read(f, binary.LittleEndian, &vec); err != nil {
+				return err
+			}
 		}
 
 		node := &Node[T]{
