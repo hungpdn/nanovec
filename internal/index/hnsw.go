@@ -30,6 +30,9 @@ type HNSWIndex struct {
 	enterPoint int            // Internal Index of the entry node
 	maxLevel   int            // Current max level in the graph
 
+	// Optimization: Reuse visited maps to reduce GC pressure
+	visitedPool sync.Pool
+
 	// Metadata storage (Same as FlatIndex)
 	Metadata map[string]map[string]any
 }
@@ -43,7 +46,7 @@ type hnswNode struct {
 }
 
 func NewHNSWIndex(dim, m, efConstruction int) *HNSWIndex {
-	return &HNSWIndex{
+	idx := &HNSWIndex{
 		dim:            dim,
 		M:              m,
 		MMax0:          m * 2,
@@ -55,6 +58,14 @@ func NewHNSWIndex(dim, m, efConstruction int) *HNSWIndex {
 		enterPoint:     -1,
 		maxLevel:       -1,
 	}
+
+	idx.visitedPool.New = func() any {
+		// Pre-allocate map with estimated capacity to avoid resize during traversal
+		// Using EfConstruction as a heuristic for visited set size
+		return make(map[int]bool, efConstruction)
+	}
+
+	return idx
 }
 
 // Add inserts a vector into the HNSW graph
@@ -72,7 +83,12 @@ func (idx *HNSWIndex) Add(id string, vec types.Vector, meta map[string]any) erro
 // searchLayer performs BFS with priority queue (Beam Search)
 // Returns list of candidates sorted by Score DESC (Closest first)
 func (idx *HNSWIndex) searchLayer(query types.Vector, entryPoint, ef, level int) []pqItem {
-	visited := make(map[int]bool)
+	visited := idx.visitedPool.Get().(map[int]bool)
+	defer func() {
+		clear(visited)
+		idx.visitedPool.Put(visited)
+	}()
+
 	visited[entryPoint] = true
 
 	// Candidates queue (Min-Heap by definition, but we store items to Explore)
@@ -105,7 +121,6 @@ func (idx *HNSWIndex) searchLayer(query types.Vector, entryPoint, ef, level int)
 			break
 		}
 
-		// Explore neighbors
 		for _, neighborID := range idx.nodes[curr.id].neighbors[level] {
 			if !visited[neighborID] {
 				visited[neighborID] = true
@@ -249,6 +264,7 @@ func (idx *HNSWIndex) Search(query types.Vector, k int, filter types.FilterFunc)
 	for _, c := range candidates {
 		id := idx.nodes[c.id].id
 
+		// Check for ghost nodes (Soft Deleted)
 		if _, exists := idx.idMap[id]; !exists {
 			continue
 		}
@@ -280,23 +296,13 @@ func (idx *HNSWIndex) AddBatch(ids []string, vecs []types.Vector, metas []map[st
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
-	// Pre-validate
 	for _, id := range ids {
 		if _, exists := idx.idMap[id]; exists {
 			return fmt.Errorf("id %s already exists", id)
 		}
 	}
 
-	// Loop Add (Internal logic reused)
-	// Ideally we would refactor Add() to split locking, but for now we unlock/lock or copy logic.
-	// To avoid deadlock, we need an internalAdd function.
-	// But since we are already holding Lock, we can't call idx.Add().
-	// Strategy: Copy Add logic here or refactor.
-	// For brevity in this response, we assume sequential add is acceptable under one big lock.
-
 	for i, id := range ids {
-		// ... (Copy of Add Logic without locking) ...
-		// Simulating call to internal logic:
 		if err := idx.internalAdd(id, vecs[i], metas[i]); err != nil {
 			return err
 		}
@@ -391,6 +397,7 @@ func (idx *HNSWIndex) Dim() int {
 	return idx.dim
 }
 
+// Atomic Save for HNSW
 func (idx *HNSWIndex) Save(path string) error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
