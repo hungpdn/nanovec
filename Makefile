@@ -30,7 +30,7 @@ fmt:
 # Run linter (requires golangci-lint)
 lint:
 	@echo "Linting code..."
-	golangci-lint run
+	golangci-lint run --out-format=colored-line-number
 
 # Clean up build artifacts and temp data
 clean:
