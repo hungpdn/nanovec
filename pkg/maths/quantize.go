@@ -2,8 +2,6 @@ package maths
 
 import "github.com/hungpdn/nanovec/pkg/types"
 
-const InvScale = 1.0 / 127.5
-
 // QuantizeSQ8 converts a float32 vector to uint8 (0-255).
 // It assumes the vector is normalized or falls roughly within [-1, 1].
 // This maps [-1.0, 1.0] to [0, 255].

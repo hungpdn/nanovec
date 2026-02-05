@@ -49,72 +49,74 @@ type HNSWIndex[T types.Number] struct {
 	// distQueryFunc calculates distance between query (float32) and node (T)
 	distQueryFunc func(query []float32, node []T) float32
 	// distNodeFunc calculates distance between two nodes (T and T)
-	distNodeFunc func(a, b []T) float32
+	distNodeFunc func(a, b *Node[T]) float32
 }
 
 // Node represents a point in the graph
 type Node[T types.Number] struct {
 	ID        string
 	Vec       []T
+	VecSum    uint32 // Pre-computed sum for SQ8 (0 for Float32)
 	Level     int
 	Neighbors [][]int      // [level][neighbor_internal_index]
 	mu        sync.RWMutex // Fine-grained lock for this specific node
 }
 
-func newHNSWIndex[T types.Number](dim, m, efConstruction int,
-	conv func([]float32) []T,
-	distQ func([]float32, []T) float32,
-	distN func([]T, []T) float32) *HNSWIndex[T] {
-
-	idx := &HNSWIndex[T]{
+// NewHNSWIndexFloat creates a standard Float32 HNSW index
+func NewHNSWIndexFloat(dim, m, efConstruction int) *HNSWIndex[float32] {
+	idx := &HNSWIndex[float32]{
 		dim:            dim,
 		M:              m,
 		MMax0:          m * 2,
 		EfConstruction: efConstruction,
 		LevelMult:      1.0 / math.Log(float64(m)),
-		nodes:          make([]*Node[T], 0),
+		nodes:          make([]*Node[float32], 0),
 		idMap:          make(map[string]int),
 		tombstones:     bitset.New(0),
 		Metadata:       make(map[string]map[string]any),
 		enterPoint:     -1,
 		maxLevel:       -1,
-		convertFunc:    conv,
-		distQueryFunc:  distQ,
-		distNodeFunc:   distN,
-		searchCtxPool: &sync.Pool{
-			New: func() any {
-				return newSearchCtx(m * 2)
-			},
-		},
-	}
-	return idx
-}
-
-// NewHNSWIndexFloat creates a standard Float32 HNSW index
-func NewHNSWIndexFloat(dim, m, efConstruction int) *HNSWIndex[float32] {
-	return newHNSWIndex(dim, m, efConstruction,
-		func(normVec []float32) []float32 {
+		convertFunc: func(normVec []float32) []float32 {
 			out := make([]float32, len(normVec))
 			copy(out, normVec)
 			return out
 		},
-		maths.DotProduct,
-		maths.DotProduct,
-	)
+		distQueryFunc: maths.DotProduct,
+		distNodeFunc: func(a, b *Node[float32]) float32 {
+			return maths.DotProduct(a.Vec, b.Vec)
+		},
+		searchCtxPool: &sync.Pool{New: func() any { return newSearchCtx(m * 2) }},
+	}
+	return idx
 }
 
 // NewHNSWIndexSQ8 creates a sq8 HNSW index
 func NewHNSWIndexSQ8(dim, m, efConstruction int) *HNSWIndex[uint8] {
-	return newHNSWIndex(dim, m, efConstruction,
-		func(normVec []float32) []uint8 {
+	idx := &HNSWIndex[uint8]{
+		dim:            dim,
+		M:              m,
+		MMax0:          m * 2,
+		EfConstruction: efConstruction,
+		LevelMult:      1.0 / math.Log(float64(m)),
+		nodes:          make([]*Node[uint8], 0),
+		idMap:          make(map[string]int),
+		tombstones:     bitset.New(0),
+		Metadata:       make(map[string]map[string]any),
+		enterPoint:     -1,
+		maxLevel:       -1,
+		convertFunc: func(normVec []float32) []uint8 {
 			return maths.QuantizeSQ8(normVec)
 		},
-		maths.DotProductSQ8,
-		maths.DotProductUint8,
-	)
+		distQueryFunc: maths.DotProductSQ8,
+		distNodeFunc: func(a, b *Node[uint8]) float32 {
+			return maths.DotProductUint8Precomputed(a.Vec, b.Vec, a.VecSum, b.VecSum)
+		},
+		searchCtxPool: &sync.Pool{New: func() any { return newSearchCtx(m * 2) }},
+	}
+	return idx
 }
 
-// Add inserts a single vector into the HNSW graph (Thread-safe & Compatible with Parallel AddBatch)
+// Add inserts a single vector
 func (idx *HNSWIndex[T]) Add(id string, vec types.Vector, meta map[string]any) error {
 	ctx := idx.searchCtxPool.Get().(*searchCtx)
 	defer idx.searchCtxPool.Put(ctx)
@@ -133,10 +135,16 @@ func (idx *HNSWIndex[T]) Add(id string, vec types.Vector, meta map[string]any) e
 	maths.NormalizeInPlace(navQuery)
 	storedVec := idx.convertFunc(navQuery)
 
+	var vecSum uint32
+	if v, ok := any(storedVec).([]uint8); ok {
+		vecSum = maths.CalculateVecSum(v)
+	}
+
 	level := ctx.randomLevel()
 	node := &Node[T]{
 		ID:        id,
 		Vec:       storedVec,
+		VecSum:    vecSum,
 		Level:     level,
 		Neighbors: make([][]int, level+1),
 	}
@@ -202,28 +210,32 @@ func (idx *HNSWIndex[T]) AddBatch(ids []string, vecs []types.Vector, metas []map
 	flatBuf := make([]float32, count*idx.dim)
 	normalizedVecs := make([][]float32, count)
 
-	// Local variables for Batch Global State Update (Fix Race Condition)
+	// Local variables for Batch Global State Update
 	var batchMaxLevel int = -1
 	var batchEP int = -1
 
 	for i := 0; i < count; i++ {
-		// Slice from the single backing array
 		start := i * idx.dim
 		end := start + idx.dim
 		nv := flatBuf[start:end]
 
-		// Normalize
 		copy(nv, vecs[i])
 		maths.NormalizeInPlace(nv)
 		normalizedVecs[i] = nv
 
 		storedVec := idx.convertFunc(nv)
 
+		var vecSum uint32
+		if v, ok := any(storedVec).([]uint8); ok {
+			vecSum = maths.CalculateVecSum(v)
+		}
+
 		level := rngCtx.randomLevel()
 
 		node := &Node[T]{
 			ID:        ids[i],
 			Vec:       storedVec,
+			VecSum:    vecSum,
 			Level:     level,
 			Neighbors: make([][]int, level+1),
 		}
@@ -249,15 +261,12 @@ func (idx *HNSWIndex[T]) AddBatch(ids []string, vecs []types.Vector, metas []map
 	}
 
 	idx.searchCtxPool.Put(rngCtx)
-
-	// Release Global Lock immediately
 	idx.mu.Unlock()
 
 	// Phase 2: Parallel Linking (Fine-Grained)
 	idx.mu.RLock()
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, runtime.GOMAXPROCS(0))
-
 	for i := 0; i < count; i++ {
 		wg.Add(1)
 		sem <- struct{}{} // Block here if full
@@ -458,9 +467,6 @@ func (idx *HNSWIndex[T]) searchLayerLocked(ctx *searchCtx, query types.Vector, e
 // addConnectionLocked connects two nodes safely
 func (idx *HNSWIndex[T]) addConnectionLocked(ctx *searchCtx, level, from, to int) {
 	node := idx.nodes[from]
-
-	// Lock write: Only lock the 'from' node
-	// This prevents deadlock because we never hold 2 node locks at the same time
 	node.mu.Lock()
 	defer node.mu.Unlock()
 
@@ -477,45 +483,31 @@ func (idx *HNSWIndex[T]) addConnectionLocked(ctx *searchCtx, level, from, to int
 	}
 
 	if len(node.Neighbors[level]) > maxM {
-		// Heuristic Pruning: Keep the best
-		fromVec := idx.nodes[from].Vec
+		fromNode := idx.nodes[from]
 
-		// Reuse Heap in context (save alloc)
 		h := ctx.results
 		*h = (*h)[:0] // Reset
 
 		for _, neighborID := range node.Neighbors[level] {
-			// Node to Node distance
-			score := idx.distNodeFunc(fromVec, idx.nodes[neighborID].Vec)
+			score := idx.distNodeFunc(fromNode, idx.nodes[neighborID])
 			heap.Push(h, pqItem{id: neighborID, score: score})
 
-			// Keep only top maxM (Best scores).
-			// MinHeap pops the Lowest score.
-			// Wait: We want to KEEP the Highest scores (Best neighbors).
-			// If we use MinHeap, Pop() removes the WORST candidate.
-			// So if Len > maxM, Pop() removes the one with lowest similarity. Correct.
 			if h.Len() > maxM {
 				heap.Pop(h)
 			}
 		}
 
-		// Reconstruct neighbors list
-		// Reuse buffer for neighbors list?
-		// node.Neighbors[level] is the persistent storage, we must overwrite it.
-		// We can reuse the existing slice capacity if possible, but simpler to just alloc the small slice here.
 		newNeighbors := make([]int, h.Len())
 		for i := 0; i < len(newNeighbors); i++ {
 			newNeighbors[i] = (*h)[i].id
 		}
 		node.Neighbors[level] = newNeighbors
-
-		// Clean up heap for next use
 		*h = (*h)[:0]
 	}
 }
 
 // Search performs Approximate Nearest Neighbor search
-// Note: 'query' must be already normalized.
+// Note: 'query' must be already normalized
 func (idx *HNSWIndex[T]) Search(query types.Vector, k int, filter types.FilterFunc) ([]types.SearchResult, error) {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
@@ -601,11 +593,6 @@ func (idx *HNSWIndex[T]) Delete(id string) error {
 	return nil
 }
 
-// Persistence
-// For serialization, we define a DTO to avoid exposing all internal fields if not needed,
-// but for simplicity in generics, we can export fields on Node[T] and use it directly.
-// In the code above, Node[T] fields are Exported.
-
 // Save stores the index to disk using Buffered I/O + Binary + JSON
 func (idx *HNSWIndex[T]) Save(path string) error {
 	idx.mu.Lock()
@@ -659,11 +646,12 @@ func (idx *HNSWIndex[T]) Save(path string) error {
 		if _, err := w.Write(idBytes); err != nil {
 			return err
 		}
-
+		if err := binary.Write(w, binary.LittleEndian, uint32(node.VecSum)); err != nil {
+			return err
+		}
 		if err := binary.Write(w, binary.LittleEndian, int32(node.Level)); err != nil {
 			return err
 		}
-
 		numLayers := int32(len(node.Neighbors))
 		if err := binary.Write(w, binary.LittleEndian, numLayers); err != nil {
 			return err
@@ -679,13 +667,11 @@ func (idx *HNSWIndex[T]) Save(path string) error {
 			for _, nID := range layer {
 				neighborBuf = append(neighborBuf, int32(nID))
 			}
-			// Write neighbors as a block
 			if err := binary.Write(w, binary.LittleEndian, neighborBuf); err != nil {
 				return err
 			}
 		}
 
-		// Optimized Vector Write
 		switch v := any(node.Vec).(type) {
 		case []float32:
 			if err := binary.Write(w, binary.LittleEndian, v); err != nil {
@@ -725,7 +711,6 @@ func (idx *HNSWIndex[T]) Save(path string) error {
 		return err
 	}
 
-	// IMPORTANT: Flush buffer to disk
 	if err := w.Flush(); err != nil {
 		return err
 	}
@@ -782,7 +767,7 @@ func (idx *HNSWIndex[T]) Load(path string) error {
 
 	if err := binary.Read(r, binary.LittleEndian, &idx.LevelMult); err != nil {
 		return err
-	} // float64
+	}
 
 	if err := binary.Read(r, binary.LittleEndian, &ep32); err != nil {
 		return err
@@ -797,12 +782,12 @@ func (idx *HNSWIndex[T]) Load(path string) error {
 	if err := binary.Read(r, binary.LittleEndian, &count32); err != nil {
 		return err
 	}
-	count := int(count32)
 
-	// Sanity Checks
+	count := int(count32)
 	if count < 0 {
 		return fmt.Errorf("corrupted file: negative node count %d", count)
 	}
+
 	minBytesPerNode := int64(12 + idx.dim)
 	minRequiredSize := int64(count) * minBytesPerNode
 	if fileSize < minRequiredSize {
@@ -828,6 +813,11 @@ func (idx *HNSWIndex[T]) Load(path string) error {
 			return err
 		}
 		id := string(idBytes)
+
+		var vecSum uint32
+		if err := binary.Read(r, binary.LittleEndian, &vecSum); err != nil {
+			return err
+		}
 
 		var level int32
 		if err := binary.Read(r, binary.LittleEndian, &level); err != nil {
@@ -877,6 +867,7 @@ func (idx *HNSWIndex[T]) Load(path string) error {
 		node := &nodePool[i]
 		node.ID = id
 		node.Vec = vec
+		node.VecSum = vecSum
 		node.Level = int(level)
 		node.Neighbors = neighbors
 
@@ -892,12 +883,10 @@ func (idx *HNSWIndex[T]) Load(path string) error {
 	if metaLen < 0 {
 		return fmt.Errorf("invalid meta len")
 	}
-
 	metaBytes := make([]byte, metaLen)
 	if _, err := io.ReadFull(r, metaBytes); err != nil {
 		return err
 	}
-
 	idx.Metadata = make(map[string]map[string]any)
 	if err := json.Unmarshal(metaBytes, &idx.Metadata); err != nil {
 		return err
@@ -911,12 +900,10 @@ func (idx *HNSWIndex[T]) Load(path string) error {
 	if err := binary.Read(r, binary.LittleEndian, &tsDataLen); err != nil {
 		return err
 	}
-
 	tsData := make([]uint64, tsDataLen)
 	if err := binary.Read(r, binary.LittleEndian, &tsData); err != nil {
 		return err
 	}
-
 	idx.tombstones = &bitset.BitSet{Size: int(tsSize), Data: tsData}
 
 	// Clean ghosts
