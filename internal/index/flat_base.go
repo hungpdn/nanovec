@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"sync"
+	"unsafe"
 
 	"github.com/hungpdn/nanovec/pkg/errors"
 )
@@ -16,19 +17,19 @@ type BaseIndex struct {
 	// Map the reverse position of the ID
 	// IDs[0] correspond to the starting vector at RawVectors[0]
 	// IDs[1] correspond to the starting vector at RawVectors[dim]
-	dim      int
-	idMap    map[string]int
-	IDs      []string
-	Metadata map[string]map[string]any
-	Version  uint64
+	dim       int
+	idMap     map[string]int
+	IDs       []string
+	Metadatas []map[string]any
+	Version   uint64
 }
 
 func NewBaseIndex(dim int) BaseIndex {
 	return BaseIndex{
-		dim:      dim,
-		idMap:    make(map[string]int),
-		IDs:      make([]string, 0),
-		Metadata: make(map[string]map[string]any),
+		dim:       dim,
+		idMap:     make(map[string]int),
+		IDs:       make([]string, 0),
+		Metadatas: make([]map[string]any, 0),
 	}
 }
 
@@ -50,7 +51,7 @@ func (b *BaseIndex) CheckID(id string) error {
 func (b *BaseIndex) AddMeta(id string, meta map[string]any) {
 	b.IDs = append(b.IDs, id)
 	b.idMap[id] = len(b.IDs) - 1
-	b.Metadata[id] = meta
+	b.Metadatas = append(b.Metadatas, meta)
 }
 
 // PrepareDelete return the position to be deleted and the last index to perform Swap-and-Pop
@@ -64,18 +65,27 @@ func (b *BaseIndex) PrepareDelete(id string) (int, int, bool) {
 	return pos, lastIndex, true
 }
 
-// CommitDelete perform metadata deletion and map updates after vector swapping
+// CommitDelete performs Swap-and-Pop on both IDs and Metadatas
 func (b *BaseIndex) CommitDelete(id string, pos, lastIndex int) {
-	// Update the map for the last element that was just swapped
+	// Swap data from lastIndex to pos
 	if pos < lastIndex {
 		lastID := b.IDs[lastIndex]
+		lastMeta := b.Metadatas[lastIndex]
+
 		b.IDs[pos] = lastID
+		b.Metadatas[pos] = lastMeta
+
 		b.idMap[lastID] = pos
 	}
 
+	// Remove last element
 	delete(b.idMap, id)
-	delete(b.Metadata, id)
+	// Zero out pointers to avoid memory leaks
+	b.IDs[lastIndex] = ""
+	b.Metadatas[lastIndex] = nil
+
 	b.IDs = b.IDs[:lastIndex]
+	b.Metadatas = b.Metadatas[:lastIndex]
 }
 
 // Dim
@@ -100,9 +110,9 @@ func (b *BaseIndex) GetVersion() uint64 {
 	return b.Version
 }
 
-// SaveBase: save common sections (IDs, Metadata) using BINARY + JSON (No Gob)
+// SaveBase
+// Format: [Count] -> [IDs...] -> [Version] -> [Meta Items...]
 func (b *BaseIndex) SaveBase(w io.Writer) error {
-
 	count := int32(len(b.IDs))
 	if err := binary.Write(w, binary.LittleEndian, count); err != nil {
 		return err
@@ -121,15 +131,24 @@ func (b *BaseIndex) SaveBase(w io.Writer) error {
 		return err
 	}
 
-	metaJSON, err := json.Marshal(b.Metadata)
-	if err != nil {
-		return err
-	}
-	if err := binary.Write(w, binary.LittleEndian, int32(len(metaJSON))); err != nil {
-		return err
-	}
-	if _, err := w.Write(metaJSON); err != nil {
-		return err
+	for _, meta := range b.Metadatas {
+		var metaBytes []byte
+		var err error
+		if meta != nil {
+			metaBytes, err = json.Marshal(meta)
+			if err != nil {
+				return err
+			}
+		} else {
+			metaBytes = []byte("null")
+		}
+
+		if err := binary.Write(w, binary.LittleEndian, int32(len(metaBytes))); err != nil {
+			return err
+		}
+		if _, err := w.Write(metaBytes); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -167,21 +186,26 @@ func (b *BaseIndex) LoadBase(r io.Reader) error {
 		return err
 	}
 
-	var metaLen int32
-	if err := binary.Read(r, binary.LittleEndian, &metaLen); err != nil {
-		return err
-	}
-	if metaLen < 0 {
-		return errors.ErrDimMismatch
-	}
+	b.Metadatas = make([]map[string]any, count)
+	for i := 0; i < int(count); i++ {
+		var metaLen int32
+		if err := binary.Read(r, binary.LittleEndian, &metaLen); err != nil {
+			return err
+		}
+		if metaLen < 0 {
+			return errors.ErrDimMismatch
+		}
 
-	metaJSON := make([]byte, metaLen)
-	if _, err := io.ReadFull(r, metaJSON); err != nil {
-		return err
-	}
+		metaBytes := make([]byte, metaLen)
+		if _, err := io.ReadFull(r, metaBytes); err != nil {
+			return err
+		}
 
-	if err := json.Unmarshal(metaJSON, &b.Metadata); err != nil {
-		return err
+		var meta map[string]any
+		if err := json.Unmarshal(metaBytes, &meta); err != nil {
+			return err
+		}
+		b.Metadatas[i] = meta
 	}
 
 	return nil
@@ -204,4 +228,31 @@ func (h *ResultHeap) Pop() any {
 	item := old[n-1]
 	*h = old[0 : n-1]
 	return item
+}
+
+// unsafeCast converts []byte to []T without copying using Go 1.17+ unsafe.Slice
+// The unsafeCast technique assumes that the byte order (Endianness) of the file on
+// disk matches that of the CPU (usually Little Endian). If you copy a DB file from
+// an x86 machine (Little Endian) to an s390x mainframe (Big Endian), the float data will be incorrect.
+func unsafeCast[T any](data []byte) []T {
+	if len(data) == 0 {
+		return nil
+	}
+	var zero T
+	sizeOfT := int(unsafe.Sizeof(zero))
+	count := len(data) / sizeOfT
+
+	ptr := unsafe.Pointer(&data[0])
+	return unsafe.Slice((*T)(ptr), count)
+}
+
+// bytesFromSlice casts []T to []byte (Zero-Copy)
+func bytesFromSlice[T any](s []T) []byte {
+	if len(s) == 0 {
+		return nil
+	}
+	var zero T
+	sizeOfT := int(unsafe.Sizeof(zero))
+	length := len(s) * sizeOfT
+	return unsafe.Slice((*byte)(unsafe.Pointer(&s[0])), length)
 }

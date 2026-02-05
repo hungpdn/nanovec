@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"os"
 	"sync"
 	"time"
 
@@ -27,28 +28,40 @@ type BoltStorage struct {
 }
 
 // NewBoltStorage opens the database
-func NewBoltStorage(path string) (*BoltStorage, error) {
-	db, err := bbolt.Open(path, 0600, &bbolt.Options{
+func NewBoltStorage(path string, readOnly bool) (*BoltStorage, error) {
+	options := &bbolt.Options{
 		Timeout:        1 * time.Second,
 		NoFreelistSync: false, // Set false for reliability (prevent corruption on power loss)
-	})
+		ReadOnly:       readOnly,
+	}
+
+	fileMode := os.FileMode(0600)
+	if readOnly {
+		fileMode = 0666
+	}
+
+	db, err := bbolt.Open(path, fileMode, options)
 	if err != nil {
 		return nil, fmt.Errorf("could not open bolt db: %v", err)
 	}
 
-	err = db.Update(func(tx *bbolt.Tx) error {
-		_, _ = tx.CreateBucketIfNotExists([]byte(bucketDocuments))
-		_, _ = tx.CreateBucketIfNotExists([]byte(bucketMeta))
-		return nil
-	})
+	if !readOnly {
+		err = db.Update(func(tx *bbolt.Tx) error {
+			_, _ = tx.CreateBucketIfNotExists([]byte(bucketDocuments))
+			_, _ = tx.CreateBucketIfNotExists([]byte(bucketMeta))
+			return nil
+		})
 
-	if err != nil {
-		_ = db.Close()
-		return nil, err
+		if err != nil {
+			_ = db.Close()
+			return nil, err
+		}
 	}
 
 	s := &BoltStorage{db: db}
-	_ = s.SyncDocCount() // Auto-repair counter on startup
+	if !readOnly {
+		_ = s.SyncDocCount() // Auto-repair counter on startup
+	}
 	return s, nil
 }
 

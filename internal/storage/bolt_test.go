@@ -13,7 +13,7 @@ func TestBoltStorage_BasicOperations(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test_basic.db")
 
-	store, err := NewBoltStorage(dbPath)
+	store, err := NewBoltStorage(dbPath, false)
 	if err != nil {
 		t.Fatalf("Failed to open storage: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestBoltStorage_BasicOperations(t *testing.T) {
 func TestBoltStorage_BatchArena(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test_batch.db")
-	store, _ := NewBoltStorage(dbPath)
+	store, _ := NewBoltStorage(dbPath, false)
 	defer store.Close()
 
 	docs := []*types.Document{
@@ -115,7 +115,7 @@ func TestBoltStorage_BatchArena(t *testing.T) {
 func TestBoltStorage_MemorySafety(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test_safety.db")
-	store, _ := NewBoltStorage(dbPath)
+	store, _ := NewBoltStorage(dbPath, false)
 	defer store.Close()
 
 	// Vector exceeding MaxAllowedDim (32768)
@@ -136,13 +136,13 @@ func TestBoltStorage_SelfHealing(t *testing.T) {
 	dbPath := filepath.Join(tmpDir, "test_healing.db")
 
 	// 1. Initial Insert
-	store, _ := NewBoltStorage(dbPath)
+	store, _ := NewBoltStorage(dbPath, false)
 	_, _ = store.Put(&types.Document{ID: "d1", Vector: []float32{1.0}})
 	store.Close()
 
 	// 2. Re-open Database
 	// NewBoltStorage automatically calls SyncDocCount()
-	store2, err := NewBoltStorage(dbPath)
+	store2, err := NewBoltStorage(dbPath, false)
 	if err != nil {
 		t.Fatalf("Failed to re-open DB: %v", err)
 	}

@@ -42,7 +42,7 @@ func Open(path string, cfg *Config) (*DB, error) {
 	cfg = &finalConfig
 
 	storePath := path + ".store"
-	store, err := storage.NewBoltStorage(storePath)
+	store, err := storage.NewBoltStorage(storePath, cfg.ReadOnly)
 	if err != nil {
 		return nil, err
 	}
@@ -52,6 +52,10 @@ func Open(path string, cfg *Config) (*DB, error) {
 
 	err = idx.Load(indexPath)
 	if err != nil {
+		if cfg.ReadOnly {
+			_ = store.Close()
+			return nil, fmt.Errorf("failed to load index in read-only mode (file missing?): %v", err)
+		}
 		idx = cfg.GetVectorIndex()
 	}
 	indexLoaded := err == nil
@@ -102,6 +106,11 @@ func Open(path string, cfg *Config) (*DB, error) {
 		}
 		goto final
 	}
+
+	if cfg.ReadOnly {
+		goto final
+	}
+
 	// Self-Healing
 	needRebuild = !indexLoaded || (idxVer != storeVer)
 	if needRebuild {
@@ -186,6 +195,11 @@ final:
 
 // Insert adds or updates a vector, ensures Atomicity by treating Storage as WAL/Master
 func (db *DB) Insert(id string, vec []float32, meta map[string]any) error {
+
+	if db.config.ReadOnly {
+		return errors.ErrReadOnly
+	}
+
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -211,6 +225,10 @@ func (db *DB) Insert(id string, vec []float32, meta map[string]any) error {
 
 // InsertBatch adds multiple vectors
 func (db *DB) InsertBatch(ids []string, vecs [][]float32, metas []map[string]any) error {
+	if db.config.ReadOnly {
+		return errors.ErrReadOnly
+	}
+
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -268,6 +286,10 @@ func (db *DB) Search(query []float32, k int, filter types.FilterFunc) ([]types.S
 
 // Update updates document
 func (db *DB) Update(id string, newVec []float32, newMeta map[string]any) error {
+	if db.config.ReadOnly {
+		return errors.ErrReadOnly
+	}
+
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -313,6 +335,10 @@ func (db *DB) Update(id string, newVec []float32, newMeta map[string]any) error 
 
 // Delete removes a document
 func (db *DB) Delete(id string) error {
+	if db.config.ReadOnly {
+		return errors.ErrReadOnly
+	}
+
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -340,9 +366,13 @@ func (db *DB) Close() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	indexPath := db.path + ".idx"
-	if err := db.index.Save(indexPath); err != nil {
-		return fmt.Errorf("failed to save index: %v", err)
+	if !db.config.ReadOnly {
+		indexPath := db.path + ".idx"
+		if err := db.index.Save(indexPath); err != nil {
+			return fmt.Errorf("failed to save index: %v", err)
+		}
+	} else {
+		_ = db.index.Close()
 	}
 	return db.storage.Close()
 }
@@ -356,6 +386,10 @@ func (db *DB) Close() error {
 //
 // Recommendation: Run this function asynchronously or during maintenance windows.
 func (db *DB) Vacuum() error {
+	if db.config.ReadOnly {
+		return errors.ErrReadOnly
+	}
+
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -446,4 +480,11 @@ func (db *DB) Count() (int, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	return db.storage.Count()
+}
+
+// ReadOnly returns true if the database is in read-only mode
+func (db *DB) ReadOnly() bool {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.config.ReadOnly
 }

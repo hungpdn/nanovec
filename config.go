@@ -29,6 +29,10 @@ type Config struct {
 	// Example: 0.2 means Vacuum will only run when the number of deleted nodes is > 20% of the total number of nodes.
 	// If set to 0, the system will use the default (0.2).
 	VacuumThreshold float64
+
+	// ReadOnly mode uses mmap for instant loading (Flat Index only)
+	// Write operations (Insert/Delete) will return error in this mode
+	ReadOnly bool
 }
 
 var DefaultConfig = Config{
@@ -38,6 +42,7 @@ var DefaultConfig = Config{
 	M:               16,
 	EfConstruction:  200,
 	VacuumThreshold: 0.2,
+	ReadOnly:        false,
 }
 
 // GetVectorIndex creates the appropriate index based on configuration
@@ -51,8 +56,12 @@ func (cfg *Config) GetVectorIndex() internal.VectorIndex {
 
 	default: // Default to Flat
 		if cfg.Quantization {
-			return index.NewFlatIndexSQ8(cfg.Dimension)
+			idx := index.NewFlatIndexSQ8(cfg.Dimension)
+			idx.SetReadOnly(cfg.ReadOnly)
+			return idx
 		}
-		return index.NewFlatIndexFloat(cfg.Dimension)
+		idx := index.NewFlatIndexFloat(cfg.Dimension)
+		idx.SetReadOnly(cfg.ReadOnly)
+		return idx
 	}
 }

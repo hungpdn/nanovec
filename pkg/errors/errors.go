@@ -14,4 +14,7 @@ var (
 
 	// ErrBatchSizeMismatch is returned when the number of IDs does not match the number of vectors in a batch operation.
 	ErrBatchSizeMismatch = errors.New("batch size mismatch")
+
+	// ErrReadOnly is returned when database is in read-only mode
+	ErrReadOnly = errors.New("database is in read-only mode")
 )

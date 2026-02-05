@@ -51,6 +51,21 @@ func main() {
 
 ```
 
+### 🚀 Instant Startup with Read-Only Mode (Mmap)
+
+For large datasets (e.g., 10M+ vectors), loading the index into RAM can take minutes. Nanovec supports **Memory Mapping (mmap)** for `FlatIndex`, allowing **instant startup** (0ms load time) and OS-managed memory paging.
+
+```go
+cfg := nanovec.Config{
+    Dimension: 128,
+    IndexType: nanovec.IndexTypeFlat,
+    ReadOnly:  true, // <--- Enable Zero-Copy Load
+}
+
+// Opens instantly, even with 100GB data!
+db, _ := nanovec.Open("large_data.db", &cfg)
+```
+
 ## Benchmarks
 
 Benchmarks run on an Intel Core i7-8850H CPU @ 2.60GHz using a dataset of 128-dimensional vectors.

@@ -122,3 +122,46 @@ func ExampleDB_Vacuum() {
 	// Output:
 	// Vacuum completed.
 }
+
+// ExampleDB_ReadOnly demonstrates the Zero-Copy Mmap capability.
+// It creates a database, populates it, and then re-opens it in ReadOnly mode
+// for instant access.
+func ExampleDB_ReadOnly() {
+	// 1. Setup
+	tmpDir, _ := os.MkdirTemp("", "nanovec_mmap_*")
+	defer os.RemoveAll(tmpDir)
+	dbPath := filepath.Join(tmpDir, "mmap.db")
+
+	// 2. Write Data (Standard Mode)
+	{
+		db, _ := nanovec.Open(dbPath, &nanovec.Config{Dimension: 2})
+		_ = db.Insert("item1", []float32{1.0, 2.0}, nil)
+		db.Close() // Flush to disk
+	}
+
+	// 3. Read Data (Instant / ReadOnly Mode)
+	cfg := nanovec.Config{
+		Dimension: 2,
+		ReadOnly:  true, // Enable Mmap
+	}
+
+	dbRO, err := nanovec.Open(dbPath, &cfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer dbRO.Close() // Will unmap memory
+
+	// Search works instantly
+	results, _ := dbRO.Search([]float32{1.0, 2.0}, 1, nil)
+	fmt.Printf("Found ID: %s\n", results[0].ID)
+
+	// Writes are forbidden
+	err = dbRO.Delete("item1")
+	if err != nil {
+		fmt.Println("Write operation blocked:", err)
+	}
+
+	// Output:
+	// Found ID: item1
+	// Write operation blocked: database is in read-only mode
+}

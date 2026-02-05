@@ -152,3 +152,8 @@ func (idx *HNSWIndex[T]) DeletedCount() int {
 	defer idx.mu.RUnlock()
 	return idx.tombstones.CountSetBits()
 }
+
+// Close cleans up resources
+func (idx *HNSWIndex[T]) Close() error {
+	return nil
+}

@@ -181,3 +181,47 @@ func TestFlat_Concurrency(t *testing.T) {
 		t.Errorf("Concurrent Flat insert failed. Expected %d, got %d", expectedTotal, idx.Count())
 	}
 }
+
+// 6. Test ReadOnly Mmap Mode
+func TestFlat_ReadOnlyMmap(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "mmap.idx")
+
+	// 1. Create and Save a normal index
+	{
+		idx := NewFlatIndexFloat(2)
+		_ = idx.Add("A", []float32{1.0, 0.0}, nil)
+		_ = idx.Add("B", []float32{0.0, 1.0}, nil)
+		if err := idx.Save(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 2. Load in ReadOnly mode (Mmap)
+	idxRO := NewFlatIndexFloat(2)
+	idxRO.SetReadOnly(true) // Enable Mmap
+
+	if err := idxRO.Load(path); err != nil {
+		t.Fatalf("Failed to load mmap: %v", err)
+	}
+	defer idxRO.Close() // Must unmap
+
+	// Verify Data
+	if idxRO.Count() != 2 {
+		t.Errorf("Count mismatch in RO mode. Got %d", idxRO.Count())
+	}
+
+	// Search should work
+	results, _ := idxRO.Search([]float32{1.0, 0.0}, 1, nil)
+	if len(results) == 0 || results[0].ID != "A" {
+		t.Error("Search failed in RO mode")
+	}
+
+	// Insert/Delete should fail
+	if err := idxRO.Add("C", []float32{1, 1}, nil); err == nil {
+		t.Error("Add should fail in ReadOnly mode")
+	}
+	if err := idxRO.Delete("A"); err == nil {
+		t.Error("Delete should fail in ReadOnly mode")
+	}
+}

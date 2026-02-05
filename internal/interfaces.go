@@ -30,6 +30,8 @@ type VectorIndex interface {
 	SetVersion(v uint64)
 	// GetVersion gets the version of the index
 	GetVersion() uint64
+	// Close cleans up resources (e.g., munmap)
+	Close() error
 }
 
 // Storage: Interface for persistent storage
