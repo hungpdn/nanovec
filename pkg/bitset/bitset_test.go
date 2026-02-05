@@ -1,9 +1,37 @@
 package bitset
 
 import (
+	"bytes"
 	"fmt"
 	"testing"
 )
+
+// ExampleBitSet demonstrates how to use the package in documentation
+func ExampleBitSet() {
+	// Create a bitset to hold 70 bits
+	bs := New(70)
+
+	// Set some bits
+	bs.Set(0)
+	bs.Set(63) // Last bit of first uint64
+	bs.Set(64) // First bit of second uint64
+
+	fmt.Printf("Bit 0 is set: %v\n", bs.IsSet(0))
+	fmt.Printf("Bit 5 is set: %v\n", bs.IsSet(5))
+
+	// Resize to accommodate more bits
+	bs.Grow(150)
+	bs.Set(100)
+
+	fmt.Printf("Bit 100 is set: %v\n", bs.IsSet(100))
+	fmt.Printf("Total Size: %d\n", bs.size)
+
+	// Output:
+	// Bit 0 is set: true
+	// Bit 5 is set: false
+	// Bit 100 is set: true
+	// Total Size: 150
+}
 
 // TestNew verifies the initialization logic and underlying slice allocation
 func TestNew(t *testing.T) {
@@ -21,11 +49,11 @@ func TestNew(t *testing.T) {
 
 	for _, tt := range tests {
 		bs := New(tt.size)
-		if len(bs.Data) != tt.expectedCount {
-			t.Errorf("New(%d): expected Data len %d, got %d", tt.size, tt.expectedCount, len(bs.Data))
+		if len(bs.data) != tt.expectedCount {
+			t.Errorf("New(%d): expected Data len %d, got %d", tt.size, tt.expectedCount, len(bs.data))
 		}
-		if bs.Size != tt.size {
-			t.Errorf("New(%d): expected Size %d, got %d", tt.size, tt.size, bs.Size)
+		if bs.size != tt.size {
+			t.Errorf("New(%d): expected Size %d, got %d", tt.size, tt.size, bs.size)
 		}
 	}
 }
@@ -89,8 +117,8 @@ func TestGrow(t *testing.T) {
 	// 10 fits in 1 uint64. 100 requires 2 uint64s.
 	bs.Grow(100)
 
-	if bs.Size != 100 {
-		t.Errorf("Expected size 100, got %d", bs.Size)
+	if bs.size != 100 {
+		t.Errorf("Expected size 100, got %d", bs.size)
 	}
 
 	// 1. Check if old data persisted
@@ -105,12 +133,12 @@ func TestGrow(t *testing.T) {
 	}
 
 	// 3. Grow to smaller size (should do nothing based on your implementation)
-	oldLen := len(bs.Data)
+	oldLen := len(bs.data)
 	bs.Grow(50)
-	if bs.Size != 100 {
+	if bs.size != 100 {
 		t.Error("Grow should not shrink the size property if newSize <= oldSize")
 	}
-	if len(bs.Data) != oldLen {
+	if len(bs.data) != oldLen {
 		t.Error("Grow should not change underlying data if newSize <= oldSize")
 	}
 }
@@ -119,44 +147,73 @@ func TestGrow(t *testing.T) {
 func TestOutOfBounds(t *testing.T) {
 	bs := New(10)
 
-	// Try to set beyond size (should be ignored based on your code)
+	// 1. Try to set beyond size -> Should Auto-Grow
 	bs.Set(20)
-	if bs.IsSet(20) {
-		t.Error("IsSet(20) should be false because Size is 10")
+
+	// Verify Size increased
+	if bs.size <= 20 {
+		t.Errorf("Expected Size > 20 after auto-grow, got %d", bs.size)
 	}
 
-	// Try to check beyond size
-	if bs.IsSet(999) {
-		t.Error("IsSet(999) should be false")
+	// Verify Data is set
+	if !bs.IsSet(20) {
+		t.Error("IsSet(20) should be true because Set triggers Grow")
 	}
 
-	// Try to unset beyond size (should not panic)
-	bs.Unset(20)
+	// 2. Try to check beyond CURRENT size -> Should return false (safe check)
+	// Current size is likely 21 or 64 (block aligned), check way beyond that
+	hugeIndex := 9999
+	if bs.IsSet(hugeIndex) {
+		t.Errorf("IsSet(%d) should be false", hugeIndex)
+	}
+
+	// 3. Try to unset beyond size -> Should not panic
+	bs.Unset(hugeIndex)
 }
 
-// ExampleBitSet demonstrates how to use the package in documentation
-func ExampleBitSet() {
-	// Create a bitset to hold 70 bits
-	bs := New(70)
+// Verify population count
+func TestCountSetBits(t *testing.T) {
+	bs := New(100)
 
-	// Set some bits
-	bs.Set(0)
-	bs.Set(63) // Last bit of first uint64
-	bs.Set(64) // First bit of second uint64
+	// Set 3 bits
+	bs.Set(1)
+	bs.Set(50)
+	bs.Set(99)
 
-	fmt.Printf("Bit 0 is set: %v\n", bs.IsSet(0))
-	fmt.Printf("Bit 5 is set: %v\n", bs.IsSet(5))
+	if count := bs.CountSetBits(); count != 3 {
+		t.Errorf("Expected 3 set bits, got %d", count)
+	}
 
-	// Resize to accommodate more bits
-	bs.Grow(150)
-	bs.Set(100)
+	// Unset 1
+	bs.Unset(50)
+	if count := bs.CountSetBits(); count != 2 {
+		t.Errorf("Expected 2 set bits after unset, got %d", count)
+	}
+}
 
-	fmt.Printf("Bit 100 is set: %v\n", bs.IsSet(100))
-	fmt.Printf("Total Size: %d\n", bs.Size)
+// Verify Serialization
+func TestSerialization(t *testing.T) {
+	original := New(200)
+	original.Set(10)
+	original.Set(150)
 
-	// Output:
-	// Bit 0 is set: true
-	// Bit 5 is set: false
-	// Bit 100 is set: true
-	// Total Size: 150
+	var buf bytes.Buffer
+	if err := original.Save(&buf); err != nil {
+		t.Fatalf("Save failed: %v", err)
+	}
+
+	restored := New(0)
+	if err := restored.Load(&buf); err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	if restored.size != original.size {
+		t.Errorf("Size mismatch: want %d, got %d", original.size, restored.size)
+	}
+	if !restored.IsSet(10) || !restored.IsSet(150) {
+		t.Error("Data mismatch: bits not restored correctly")
+	}
+	if restored.CountSetBits() != 2 {
+		t.Errorf("Count mismatch: want 2, got %d", restored.CountSetBits())
+	}
 }

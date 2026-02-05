@@ -23,14 +23,21 @@ type Config struct {
 	// HNSW Parameters
 	M              int // Max connections per node (Default: 16)
 	EfConstruction int // Search beam size during build (Default: 200)
+
+	// Maintenance
+	// VacuumThreshold: Minimum garbage ratio to activate Vacuum (0.0 -> 1.0).
+	// Example: 0.2 means Vacuum will only run when the number of deleted nodes is > 20% of the total number of nodes.
+	// If set to 0, the system will use the default (0.2).
+	VacuumThreshold float64
 }
 
 var DefaultConfig = Config{
-	Dimension:      1536,
-	IndexType:      IndexTypeFlat,
-	Quantization:   false,
-	M:              16,
-	EfConstruction: 200,
+	Dimension:       1536,
+	IndexType:       IndexTypeFlat,
+	Quantization:    false,
+	M:               16,
+	EfConstruction:  200,
+	VacuumThreshold: 0.2,
 }
 
 // GetVectorIndex creates the appropriate index based on configuration

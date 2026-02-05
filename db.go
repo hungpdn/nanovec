@@ -34,6 +34,11 @@ func Open(path string, cfg *Config) (*DB, error) {
 	} else {
 		finalConfig = *cfg
 	}
+
+	if finalConfig.VacuumThreshold <= 0 || finalConfig.VacuumThreshold > 1.0 {
+		finalConfig.VacuumThreshold = DefaultConfig.VacuumThreshold
+	}
+
 	cfg = &finalConfig
 
 	storePath := path + ".store"
@@ -344,6 +349,7 @@ func (db *DB) Close() error {
 
 // Vacuum rebuilds the vector index from scratch to remove "ghost nodes" (deleted items)
 // and optimize memory usage. It mimics SQLite's VACUUM command.
+// It now includes a heuristic to SKIP if the garbage ratio is low (< 20%).
 //
 // ⚠️ BLOCKING OPERATION: This function holds a global lock (Stop-the-World) during the
 // entire rebuild process. For a 1GB dataset, this might take 10-20 seconds.
@@ -353,7 +359,27 @@ func (db *DB) Vacuum() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	log.Println("🧹 Starting VACUUM (Rebuilding Index)...")
+	// Smart Vacuum Logic
+	activeCount := db.index.Count()
+	deletedCount := db.index.DeletedCount()
+
+	if deletedCount == 0 {
+		return nil
+	}
+
+	totalNodes := activeCount + deletedCount
+	threshold := db.config.VacuumThreshold
+	garbageRatio := float64(deletedCount) / float64(totalNodes)
+
+	if garbageRatio < threshold {
+		log.Printf("🧹 Vacuum skipped: Garbage ratio %.2f%% is below threshold %.0f%% (Deleted: %d, Active: %d)",
+			garbageRatio*100, threshold*100, deletedCount, activeCount)
+		return nil
+	}
+
+	log.Printf("🧹 Starting VACUUM... Garbage Ratio: %.2f%% (Deleted: %d, Total: %d)",
+		garbageRatio*100, deletedCount, totalNodes)
+
 	start := time.Now()
 
 	docCount, _ := db.storage.Count()

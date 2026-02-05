@@ -22,8 +22,10 @@ type VectorIndex interface {
 	Load(path string) error
 	// Dim returns the dimensionality of the vectors in the index
 	Dim() int
-	//  Count returns the number of vectors in the index
+	//  Count returns the number of ACTIVE vectors in the index
 	Count() int
+	// DeletedCount returns the number of marked-as-deleted (ghost) vectors
+	DeletedCount() int
 	// SetVersion sets the version of the index
 	SetVersion(v uint64)
 	// GetVersion gets the version of the index

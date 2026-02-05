@@ -734,13 +734,7 @@ func (idx *HNSWIndex[T]) Save(path string) error {
 	}
 
 	// 4. Tombstones (Binary) to 'w'
-	if err = binary.Write(w, binary.LittleEndian, int32(idx.tombstones.Size)); err != nil {
-		return err
-	}
-	if err = binary.Write(w, binary.LittleEndian, int32(len(idx.tombstones.Data))); err != nil {
-		return err
-	}
-	if err = binary.Write(w, binary.LittleEndian, idx.tombstones.Data); err != nil {
+	if err := idx.tombstones.Save(w); err != nil {
 		return err
 	}
 
@@ -926,18 +920,10 @@ func (idx *HNSWIndex[T]) Load(path string) error {
 	}
 
 	// 4. Tombstones (Binary) from 'r'
-	var tsSize, tsDataLen int32
-	if err := binary.Read(r, binary.LittleEndian, &tsSize); err != nil {
-		return err
+	idx.tombstones = bitset.New(0)
+	if err := idx.tombstones.Load(r); err != nil {
+		return fmt.Errorf("failed to load tombstones: %w", err)
 	}
-	if err := binary.Read(r, binary.LittleEndian, &tsDataLen); err != nil {
-		return err
-	}
-	tsData := make([]uint64, tsDataLen)
-	if err := binary.Read(r, binary.LittleEndian, &tsData); err != nil {
-		return err
-	}
-	idx.tombstones = &bitset.BitSet{Size: int(tsSize), Data: tsData}
 
 	// Clean ghosts
 	for id := range idx.idMap {

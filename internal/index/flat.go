@@ -211,6 +211,22 @@ func (idx *FlatIndex[T]) Delete(id string) error {
 	return nil
 }
 
+// DeletedCount returns the number of "wasted" vector slots in the underlying slice capacity.
+// For FlatIndex, this allows Vacuum to reclaim memory when cap(RawVectors) >> len(RawVectors).
+func (idx *FlatIndex[T]) DeletedCount() int {
+	idx.RLock()
+	defer idx.RUnlock()
+
+	if idx.dim == 0 {
+		return 0
+	}
+
+	currentCap := cap(idx.RawVectors)
+	currentLen := len(idx.RawVectors)
+	unusedElems := currentCap - currentLen
+	return unusedElems / idx.dim
+}
+
 // Save persists to disk.
 func (idx *FlatIndex[T]) Save(path string) error {
 	idx.Lock()

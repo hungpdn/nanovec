@@ -145,3 +145,10 @@ func (idx *HNSWIndex[T]) GetVersion() uint64 {
 	defer idx.mu.Unlock()
 	return idx.Version
 }
+
+// DeletedCount returns the number of ghost nodes (marked in tombstones)
+func (idx *HNSWIndex[T]) DeletedCount() int {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return idx.tombstones.CountSetBits()
+}
