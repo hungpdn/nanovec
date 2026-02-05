@@ -3,6 +3,7 @@ package nanovec
 import (
 	"fmt"
 	"log"
+	"runtime"
 	"sync"
 	"time"
 
@@ -27,9 +28,13 @@ type DB struct {
 
 // Open initializes the database
 func Open(path string, cfg *Config) (*DB, error) {
+	var finalConfig Config
 	if cfg == nil {
-		cfg = &DefaultConfig
+		finalConfig = DefaultConfig
+	} else {
+		finalConfig = *cfg
 	}
+	cfg = &finalConfig
 
 	storePath := path + ".store"
 	store, err := storage.NewBoltStorage(storePath)
@@ -62,6 +67,21 @@ func Open(path string, cfg *Config) (*DB, error) {
 
 	// Self-Healing
 	if needRebuild {
+		// This prevents "dimension mismatch" error if config is wrong but data exists.
+		if count, _ := store.Count(); count > 0 {
+			// Scan 1 document to peek dimension
+			var detectedDim int
+			_ = store.Scan(func(doc *types.Document) error {
+				detectedDim = len(doc.Vector)
+				return fmt.Errorf("stop") // Hack to stop scanning after 1 item
+			})
+
+			if detectedDim > 0 && detectedDim != cfg.Dimension {
+				log.Printf("⚠️ Config dimension (%d) mismatch with Storage (%d). Auto-adjusting...", cfg.Dimension, detectedDim)
+				cfg.Dimension = detectedDim
+			}
+		}
+
 		reason := "Index missing"
 		if indexLoaded && idxVer != storeVer {
 			reason = fmt.Sprintf("Version mismatch (Index: %d, Store: %d)", idxVer, storeVer)
@@ -114,7 +134,7 @@ func Open(path string, cfg *Config) (*DB, error) {
 
 	return &DB{
 		path:    path,
-		config:  *cfg,
+		config:  finalConfig,
 		index:   idx,
 		storage: store,
 		searchBufPool: &sync.Pool{
@@ -279,4 +299,85 @@ func (db *DB) Close() error {
 		return fmt.Errorf("failed to save index: %v", err)
 	}
 	return db.storage.Close()
+}
+
+// Vacuum rebuilds the vector index from scratch to remove "ghost nodes" (deleted items)
+// and optimize memory usage. It mimics SQLite's VACUUM command.
+// This is a blocking operation and should be called periodically or during maintenance windows.
+func (db *DB) Vacuum() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	log.Println("🧹 Starting VACUUM (Rebuilding Index)...")
+	start := time.Now()
+
+	// 1. Create a fresh, empty Index (Snapshot configuration from current)
+	// New index starts with 0 nodes, effectively removing all ghosts.
+	newIdx := db.config.GetVectorIndex()
+
+	// 2. Scan Storage (Source of Truth)
+	// BoltDB Delete operation removes keys physically (or via free-list),
+	// so Scan() ONLY iterates over "Live" documents.
+	const batchSize = 1000
+	var batchIDs []string
+	var batchVecs []types.Vector
+	var batchMetas []map[string]any
+
+	count := 0
+
+	err := db.storage.Scan(func(doc *types.Document) error {
+		batchIDs = append(batchIDs, doc.ID)
+		batchVecs = append(batchVecs, doc.Vector)
+		batchMetas = append(batchMetas, doc.Metadata)
+
+		if len(batchIDs) >= batchSize {
+			if err := newIdx.AddBatch(batchIDs, batchVecs, batchMetas); err != nil {
+				return err
+			}
+			// Reset slices (Reuse memory)
+			batchIDs = batchIDs[:0]
+			batchVecs = batchVecs[:0]
+			batchMetas = batchMetas[:0]
+		}
+		count++
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("vacuum scan failed: %v", err)
+	}
+
+	// Flush remaining items
+	if len(batchIDs) > 0 {
+		if err := newIdx.AddBatch(batchIDs, batchVecs, batchMetas); err != nil {
+			return fmt.Errorf("vacuum flush failed: %v", err)
+		}
+	}
+
+	// 3. Sync Version
+	// Ensure the new index carries the correct version from storage
+	storeVer, err := db.storage.GetVersion()
+	if err != nil {
+		return fmt.Errorf("failed to get storage version: %v", err)
+	}
+	newIdx.SetVersion(storeVer)
+
+	// 4. Atomic Swap (In Memory)
+	// Replace the old bloated index with the new compact one.
+	// The old index becomes unreachable and will be Garbage Collected.
+	db.index = newIdx
+
+	// 5. Persist immediately (Safe-guard)
+	// Overwrite the old .idx file with the compact version.
+	// Even if this fails, the RAM index is valid. If process crashes, Open() will rebuild.
+	indexPath := db.path + ".idx"
+	if err := db.index.Save(indexPath); err != nil {
+		log.Printf("⚠️ Warning: Vacuum save failed (RAM is OK): %v", err)
+	}
+
+	// 6. Force Garbage Collection
+	// Explicitly ask Go to reclaim memory from the old index immediately.
+	runtime.GC()
+
+	log.Printf("✅ VACUUM completed in %v. Index optimized (Items: %d).", time.Since(start), count)
+	return nil
 }

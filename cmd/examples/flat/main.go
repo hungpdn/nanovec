@@ -84,6 +84,10 @@ func main() {
 	if db2.Exists("doc1") {
 		fmt.Println("-> 'doc1' confirmed to exist after restart.")
 	}
+
+	if err := db2.Vacuum(); err != nil {
+		log.Printf("Vacuum error: %v", err)
+	}
 }
 
 func printResults(results []types.SearchResult) {
