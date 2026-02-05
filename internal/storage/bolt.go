@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/gob"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/hungpdn/nanovec/pkg/types"
@@ -23,7 +24,7 @@ type BoltStorage struct {
 	db *bbolt.DB
 }
 
-// NewBoltStorage opens the database and creates the buckets if not exists
+// NewBoltStorage opens the database
 func NewBoltStorage(path string) (*BoltStorage, error) {
 	db, err := bbolt.Open(path, 0600, &bbolt.Options{
 		Timeout:        1 * time.Second,
@@ -47,7 +48,85 @@ func NewBoltStorage(path string) (*BoltStorage, error) {
 	return &BoltStorage{db: db}, nil
 }
 
-// GetVersion returns the current modification sequence of the storage
+// --- High Performance Serialization Helpers ---
+
+// serializeDocument encodes document to binary format efficiently
+// Format: [Dim(4b)][Vector(dim*4b)][GobMetadata(...)]
+func serializeDocument(doc *types.Document) ([]byte, error) {
+	dim := len(doc.Vector)
+	vecSize := 4 + dim*4 // 4 bytes for header + data
+
+	// 1. Pre-allocate buffer for Vector Part
+	buf := make([]byte, vecSize)
+
+	// 2. Write Dimension
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(dim))
+
+	// 3. Write Vector Data (Fast Loop, No Reflection)
+	offset := 4
+	for _, v := range doc.Vector {
+		bits := math.Float32bits(v)
+		binary.LittleEndian.PutUint32(buf[offset:offset+4], bits)
+		offset += 4
+	}
+
+	// 4. Encode Metadata (Only use Gob for the map)
+	if len(doc.Metadata) > 0 {
+		var metaBuf bytes.Buffer
+		enc := gob.NewEncoder(&metaBuf)
+		if err := enc.Encode(doc.Metadata); err != nil {
+			return nil, fmt.Errorf("metadata encode failed: %w", err)
+		}
+		// Append metadata bytes to the buffer
+		buf = append(buf, metaBuf.Bytes()...)
+	}
+
+	return buf, nil
+}
+
+// deserializeDocument decodes binary data back to Document
+func deserializeDocument(id string, data []byte) (*types.Document, error) {
+	if len(data) < 4 {
+		return nil, fmt.Errorf("data too short")
+	}
+
+	// 1. Read Dimension
+	dim := int(binary.LittleEndian.Uint32(data[0:4]))
+
+	// Safety check
+	expectedVecSize := 4 + dim*4
+	if len(data) < expectedVecSize {
+		return nil, fmt.Errorf("data corrupted or truncated")
+	}
+
+	// 2. Read Vector
+	vec := make(types.Vector, dim)
+	offset := 4
+	for i := 0; i < dim; i++ {
+		bits := binary.LittleEndian.Uint32(data[offset : offset+4])
+		vec[i] = math.Float32frombits(bits)
+		offset += 4
+	}
+
+	// 3. Read Metadata (if any bytes left)
+	var meta map[string]any
+	if len(data) > expectedVecSize {
+		metaBuf := bytes.NewBuffer(data[expectedVecSize:])
+		dec := gob.NewDecoder(metaBuf)
+		if err := dec.Decode(&meta); err != nil {
+			return nil, fmt.Errorf("metadata decode failed: %w", err)
+		}
+	}
+
+	return &types.Document{
+		ID:       id, // ID comes from the BoltDB Key
+		Vector:   vec,
+		Metadata: meta,
+	}, nil
+}
+
+// --- Storage Implementation ---
+
 func (s *BoltStorage) GetVersion() (uint64, error) {
 	var ver uint64
 	err := s.db.View(func(tx *bbolt.Tx) error {
@@ -65,7 +144,6 @@ func (s *BoltStorage) GetVersion() (uint64, error) {
 func (s *BoltStorage) incVersion(tx *bbolt.Tx) error {
 	b := tx.Bucket([]byte(bucketMeta))
 	seq, _ := b.NextSequence()
-
 	buf := make([]byte, 8)
 	binary.LittleEndian.PutUint64(buf, seq)
 	return b.Put([]byte(keyDbVersion), buf)
@@ -77,20 +155,19 @@ func (s *BoltStorage) Put(doc *types.Document) error {
 		bDocs := tx.Bucket([]byte(bucketDocuments))
 		bMeta := tx.Bucket([]byte(bucketMeta))
 
-		// Check if ID exists to maintain accurate count
+		// Check existence for count
 		if bDocs.Get([]byte(doc.ID)) == nil {
 			if err := s.incrementCount(bMeta, 1); err != nil {
 				return err
 			}
 		}
-		// Optimize: Use custom binary encoding instead of Gob for speed
-		var buf bytes.Buffer
-		enc := gob.NewEncoder(&buf)
-		if err := enc.Encode(doc); err != nil {
+
+		data, err := serializeDocument(doc)
+		if err != nil {
 			return err
 		}
 
-		if err := bDocs.Put([]byte(doc.ID), buf.Bytes()); err != nil {
+		if err := bDocs.Put([]byte(doc.ID), data); err != nil {
 			return err
 		}
 
@@ -98,7 +175,7 @@ func (s *BoltStorage) Put(doc *types.Document) error {
 	})
 }
 
-// PutBatch saves multiple documents in a SINGLE transaction
+// PutBatch saves multiple documents
 func (s *BoltStorage) PutBatch(docs []*types.Document) error {
 	return s.db.Update(func(tx *bbolt.Tx) error {
 		bDocs := tx.Bucket([]byte(bucketDocuments))
@@ -119,14 +196,12 @@ func (s *BoltStorage) PutBatch(docs []*types.Document) error {
 				visited[doc.ID] = true
 			}
 
-			// Use a fresh buffer for each encode to prevent gob stream corruption (EOF errors)
-			var buf bytes.Buffer
-			enc := gob.NewEncoder(&buf)
-			if err := enc.Encode(doc); err != nil {
-				return fmt.Errorf("encode %s failed: %w", doc.ID, err)
+			data, err := serializeDocument(doc)
+			if err != nil {
+				return err
 			}
 
-			if err := bDocs.Put([]byte(doc.ID), buf.Bytes()); err != nil {
+			if err := bDocs.Put([]byte(doc.ID), data); err != nil {
 				return err
 			}
 		}
@@ -146,7 +221,7 @@ func (s *BoltStorage) PutBatch(docs []*types.Document) error {
 
 // Get read document from disk
 func (s *BoltStorage) Get(id string) (*types.Document, error) {
-	var doc types.Document
+	var doc *types.Document
 
 	err := s.db.View(func(tx *bbolt.Tx) error {
 		b := tx.Bucket([]byte(bucketDocuments))
@@ -156,10 +231,11 @@ func (s *BoltStorage) Get(id string) (*types.Document, error) {
 			return fmt.Errorf("document not found: %s", id)
 		}
 
-		buf := bytes.NewBuffer(data)
-		dec := gob.NewDecoder(buf)
-		if err := dec.Decode(&doc); err != nil {
-			return fmt.Errorf("failed to decode document: %w", err)
+		// FAST DECODING
+		var err error
+		doc, err = deserializeDocument(id, data)
+		if err != nil {
+			return err
 		}
 		return nil
 	})
@@ -167,8 +243,7 @@ func (s *BoltStorage) Get(id string) (*types.Document, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	return &doc, nil
+	return doc, nil
 }
 
 // Delete remove document
@@ -198,13 +273,13 @@ func (s *BoltStorage) Scan(fn func(doc *types.Document) error) error {
 				continue
 			}
 
-			var doc types.Document
-			buf := bytes.NewBuffer(v)
-			dec := gob.NewDecoder(buf)
-			if err := dec.Decode(&doc); err != nil {
+			// FAST DECODING using the key 'k' as the ID
+			doc, err := deserializeDocument(string(k), v)
+			if err != nil {
 				return fmt.Errorf("corrupt data for id %s: %v", k, err)
 			}
-			if err := fn(&doc); err != nil {
+
+			if err := fn(doc); err != nil {
 				return err
 			}
 		}

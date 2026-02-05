@@ -223,7 +223,8 @@ func (idx *FlatIndex[T]) Save(path string) error {
 	if err := idx.SaveBase(enc); err != nil {
 		return err
 	}
-	if err := enc.Encode(idx.RawVectors); err != nil {
+
+	if err := binary.Write(f, binary.LittleEndian, idx.RawVectors); err != nil {
 		return err
 	}
 
@@ -252,12 +253,15 @@ func (idx *FlatIndex[T]) Load(path string) error {
 		return err
 	}
 	idx.dim = int(header[0])
+	count := int(header[1])
 
 	dec := gob.NewDecoder(f)
 	if err := idx.LoadBase(dec); err != nil {
 		return err
 	}
-	if err := dec.Decode(&idx.RawVectors); err != nil {
+
+	idx.RawVectors = make([]T, count*idx.dim)
+	if err := binary.Read(f, binary.LittleEndian, &idx.RawVectors); err != nil {
 		return err
 	}
 	return nil
