@@ -6,6 +6,7 @@ import (
 
 	"github.com/hungpdn/nanovec/internal"
 	"github.com/hungpdn/nanovec/internal/storage"
+	"github.com/hungpdn/nanovec/pkg/errors"
 	"github.com/hungpdn/nanovec/pkg/types"
 )
 
@@ -95,7 +96,7 @@ func (db *DB) Insert(id string, vec []float32, meta map[string]any) error {
 	defer db.mu.Unlock()
 
 	if len(vec) != db.config.Dimension {
-		return types.ErrDimMismatch
+		return errors.ErrDimMismatch
 	}
 
 	doc := &types.Document{
@@ -124,14 +125,14 @@ func (db *DB) InsertBatch(ids []string, vecs [][]float32, metas []map[string]any
 	defer db.mu.Unlock()
 
 	if len(ids) != len(vecs) || len(ids) != len(metas) {
-		return fmt.Errorf("batch size mismatch")
+		return errors.ErrBatchSizeMismatch
 	}
 
 	typeVectors := make([]types.Vector, len(vecs))
 
 	for i, id := range ids {
 		if len(vecs[i]) != db.config.Dimension {
-			return types.ErrDimMismatch
+			return errors.ErrDimMismatch
 		}
 		typeVectors[i] = types.Vector(vecs[i])
 
@@ -163,7 +164,7 @@ func (db *DB) Search(query []float32, k int, filter types.FilterFunc) ([]types.S
 	defer db.mu.RUnlock()
 
 	if len(query) != db.config.Dimension {
-		return nil, types.ErrQueryDimMismatch
+		return nil, errors.ErrQueryDimMismatch
 	}
 
 	return db.index.Search(types.Vector(query), k, filter)

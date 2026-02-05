@@ -1,88 +1,73 @@
-package index
+package flat
 
 import (
 	"container/heap"
 	"encoding/binary"
 	"encoding/gob"
-	"errors"
-	"fmt"
 	"os"
 	"slices"
-	"sync"
 
+	"github.com/hungpdn/nanovec/pkg/errors"
 	"github.com/hungpdn/nanovec/pkg/maths"
 	"github.com/hungpdn/nanovec/pkg/types"
 )
 
-// FlatIndex: Save all vectors in Map and iterate through them during the search
+// FlatIndex save all vectors in Map and iterate through them during the search
 type FlatIndex struct {
-	mu sync.RWMutex
+	BaseIndex
 	// Example: There are 2 2D vectors [1,2] and [3,4]
 	// RawVectors = [1, 2, 3, 4] -> 100% seamless
 	RawVectors []float32
-
-	// Map the reverse position of the ID
-	// IDs[0] correspond to the starting vector at RawVectors[0]
-	// IDs[1] correspond to the starting vector at RawVectors[dim]
-	IDs      []string
-	idMap    map[string]int
-	Metadata map[string]map[string]any
-	dim      int
 }
 
 func NewFlatIndex(dim int) *FlatIndex {
 	return &FlatIndex{
+		BaseIndex:  NewBaseIndex(dim),
 		RawVectors: make([]float32, 0),
-		IDs:        make([]string, 0),
-		idMap:      make(map[string]int),
-		Metadata:   make(map[string]map[string]any),
-		dim:        dim,
 	}
 }
 
+// Add
 func (idx *FlatIndex) Add(id string, vec types.Vector, meta map[string]any) error {
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
+	idx.Lock()
+	defer idx.Unlock()
 
 	if len(vec) != idx.dim {
-		return types.ErrDimMismatch
+		return errors.ErrDimMismatch
 	}
 
-	if _, exists := idx.idMap[id]; exists {
-		return errors.New("id already exists")
+	if err := idx.CheckID(id); err != nil {
+		return err
 	}
 
 	startPos := len(idx.RawVectors)
 	idx.RawVectors = append(idx.RawVectors, vec...)
 	maths.NormalizeInPlace(idx.RawVectors[startPos:])
 
-	idx.IDs = append(idx.IDs, id)
-	idx.idMap[id] = len(idx.IDs) - 1
-	idx.Metadata[id] = meta
-
+	idx.AddMeta(id, meta)
 	return nil
 }
 
 // AddBatch adds multiple vectors in a single lock transaction.
 func (idx *FlatIndex) AddBatch(ids []string, vecs []types.Vector, metas []map[string]any) error {
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
+	idx.Lock()
+	defer idx.Unlock()
 
 	if len(ids) != len(vecs) || len(ids) != len(metas) {
-		return errors.New("batch size mismatch")
+		return errors.ErrBatchSizeMismatch
 	}
 
 	needed := 0
 	for _, v := range vecs {
 		if len(v) != idx.dim {
-			return types.ErrDimMismatch
+			return errors.ErrDimMismatch
 		}
 		needed += len(v)
 	}
 
 	for _, id := range ids {
-		if _, exists := idx.idMap[id]; exists {
-			return fmt.Errorf("id %s already exists", id)
+		if err := idx.CheckID(id); err != nil {
+			return err
 		}
 	}
 
@@ -96,48 +81,18 @@ func (idx *FlatIndex) AddBatch(ids []string, vecs []types.Vector, metas []map[st
 		idx.RawVectors = append(idx.RawVectors, vec...)
 		maths.NormalizeInPlace(idx.RawVectors[startPos:])
 
-		idx.IDs = append(idx.IDs, id)
-		idx.idMap[id] = len(idx.IDs) - 1
-		idx.Metadata[id] = meta
+		idx.AddMeta(id, meta)
 	}
 
 	return nil
 }
 
-// Delete remove vector by Swap-and-Pop
-func (idx *FlatIndex) Delete(id string) error {
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
-
-	pos, exists := idx.idMap[id]
-	if !exists {
-		return nil
-	}
-
-	lastIndex := len(idx.IDs) - 1
-	if pos < lastIndex {
-		lastID := idx.IDs[lastIndex]
-		idx.IDs[pos] = lastID
-		idx.idMap[lastID] = pos
-
-		destStart := pos * idx.dim
-		srcStart := lastIndex * idx.dim
-		copy(idx.RawVectors[destStart:destStart+idx.dim], idx.RawVectors[srcStart:srcStart+idx.dim])
-	}
-
-	delete(idx.idMap, id)
-	delete(idx.Metadata, id)
-	idx.IDs = idx.IDs[:lastIndex]
-	idx.RawVectors = idx.RawVectors[:lastIndex*idx.dim]
-
-	return nil
-}
-
+// Search
 func (idx *FlatIndex) Search(query types.Vector, k int, filter types.FilterFunc) ([]types.SearchResult, error) {
-	idx.mu.RLock()
-	defer idx.mu.RUnlock()
+	idx.RLock()
+	defer idx.RUnlock()
 
-	normalizedQuery := make([]float32, len(query))
+	normalizedQuery := make(types.Vector, len(query))
 	copy(normalizedQuery, query)
 	maths.NormalizeInPlace(normalizedQuery)
 
@@ -188,21 +143,42 @@ func (idx *FlatIndex) Search(query types.Vector, k int, filter types.FilterFunc)
 	return results, nil
 }
 
+// Delete remove vector by Swap-and-Pop
+func (idx *FlatIndex) Delete(id string) error {
+	idx.Lock()
+	defer idx.Unlock()
+
+	pos, lastIndex, exists := idx.PrepareDelete(id)
+	if !exists {
+		return nil
+	}
+
+	if pos < lastIndex {
+		destStart := pos * idx.dim
+		srcStart := lastIndex * idx.dim
+		copy(idx.RawVectors[destStart:destStart+idx.dim], idx.RawVectors[srcStart:srcStart+idx.dim])
+	}
+
+	idx.RawVectors = idx.RawVectors[:lastIndex*idx.dim]
+
+	idx.CommitDelete(id, pos, lastIndex)
+	return nil
+}
+
+// Count
 func (idx *FlatIndex) Count() int {
-	idx.mu.RLock()
-	defer idx.mu.RUnlock()
+	idx.RLock()
+	defer idx.RUnlock()
 	return len(idx.IDs)
 }
 
-func (idx *FlatIndex) Dim() int {
-	idx.mu.RLock()
-	defer idx.mu.RUnlock()
-	return idx.dim
-}
+// Dim
+func (idx *FlatIndex) Dim() int { return idx.dim }
 
+// Save save data into disk
 func (idx *FlatIndex) Save(path string) error {
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
+	idx.Lock()
+	defer idx.Unlock()
 
 	tmpPath := path + ".tmp"
 	f, err := os.Create(tmpPath)
@@ -219,10 +195,7 @@ func (idx *FlatIndex) Save(path string) error {
 	}
 
 	enc := gob.NewEncoder(f)
-	if err := enc.Encode(idx.IDs); err != nil {
-		return err
-	}
-	if err := enc.Encode(idx.Metadata); err != nil {
+	if err := idx.SaveBase(enc); err != nil {
 		return err
 	}
 	if err := enc.Encode(idx.RawVectors); err != nil {
@@ -239,10 +212,10 @@ func (idx *FlatIndex) Save(path string) error {
 	return os.Rename(tmpPath, path)
 }
 
-// Load: read data from disk
+// Load read data from disk
 func (idx *FlatIndex) Load(path string) error {
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
+	idx.Lock()
+	defer idx.Unlock()
 
 	f, err := os.Open(path)
 	if err != nil {
@@ -257,41 +230,12 @@ func (idx *FlatIndex) Load(path string) error {
 	idx.dim = int(header[0])
 
 	dec := gob.NewDecoder(f)
-	if err := dec.Decode(&idx.IDs); err != nil {
+	if err := idx.LoadBase(dec); err != nil {
 		return err
 	}
-
-	idx.Metadata = make(map[string]map[string]any)
-	if err := dec.Decode(&idx.Metadata); err != nil {
-		return err
-	}
-
-	idx.idMap = make(map[string]int, len(idx.IDs))
-	for i, id := range idx.IDs {
-		idx.idMap[id] = i
-	}
-
 	if err := dec.Decode(&idx.RawVectors); err != nil {
 		return err
 	}
 
 	return nil
-}
-
-type Item struct {
-	ID    string
-	Score float32
-}
-type ResultHeap []Item
-
-func (h ResultHeap) Len() int           { return len(h) }
-func (h ResultHeap) Less(i, j int) bool { return h[i].Score < h[j].Score } // Min-Heap
-func (h ResultHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *ResultHeap) Push(x any)        { *h = append(*h, x.(Item)) }
-func (h *ResultHeap) Pop() any {
-	old := *h
-	n := len(old)
-	item := old[n-1]
-	*h = old[0 : n-1]
-	return item
 }

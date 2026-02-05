@@ -18,6 +18,8 @@ func main() {
 	path := "./data/mydata.db"
 	cfg := nanovec.Config{
 		Dimension: 3,
+		IndexType: nanovec.IndexTypeFlat,
+		// Quantization: true, // <--- 4x RAM Savings
 	}
 
 	db, err := nanovec.Open(path, &cfg)

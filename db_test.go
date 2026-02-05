@@ -159,3 +159,56 @@ func TestHNSWIndex(t *testing.T) {
 		assertEqual(t, "vecB", results[0].ID, "Should find vecB after restart")
 	}()
 }
+
+func TestSQ8Index(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "sq8_test")
+
+	cfg := &nanovec.Config{
+		Dimension:    3,
+		IndexType:    nanovec.IndexTypeFlat,
+		Quantization: true, // <--- Enable SQ8
+	}
+
+	// 1. Insert & Search
+	func() {
+		db, err := nanovec.Open(dbPath, cfg)
+		assertNoError(t, err, "Open SQ8 DB")
+		defer db.Close()
+
+		// Insert normalized vectors (SQ8 works best with normalized data)
+		// Vec A: [1, 0, 0]
+		// Vec B: [0, 1, 0]
+		err = db.Insert("vecA", []float32{1, 0, 0}, map[string]any{"type": "A"})
+		assertNoError(t, err, "Insert A")
+		err = db.Insert("vecB", []float32{0, 1, 0}, map[string]any{"type": "B"})
+		assertNoError(t, err, "Insert B")
+
+		// Search for A
+		results, err := db.Search([]float32{1, 0, 0}, 5, nil)
+		assertNoError(t, err, "Search A")
+
+		if len(results) == 0 {
+			t.Fatal("SQ8 returned 0 results")
+		}
+
+		// SQ8 introduces slight precision loss, so score might not be exactly 1.0
+		// But for [1,0,0] vs [1,0,0], it should be extremely close.
+		assertEqual(t, "vecA", results[0].ID, "Should find vecA first")
+		if results[0].Score < 0.98 {
+			t.Errorf("Score too low for SQ8 match: %f", results[0].Score)
+		}
+	}()
+
+	// 2. Persistence
+	func() {
+		db, err := nanovec.Open(dbPath, cfg)
+		assertNoError(t, err, "Re-Open SQ8 DB")
+		defer db.Close()
+
+		results, err := db.Search([]float32{0, 1, 0}, 5, nil)
+		assertNoError(t, err, "Search B after restart")
+
+		assertEqual(t, "vecB", results[0].ID, "Should find vecB")
+	}()
+}

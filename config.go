@@ -3,6 +3,7 @@ package nanovec
 import (
 	"github.com/hungpdn/nanovec/internal"
 	"github.com/hungpdn/nanovec/internal/index"
+	"github.com/hungpdn/nanovec/internal/index/flat"
 )
 
 // IndexType defines the type of vector index
@@ -17,7 +18,8 @@ const (
 type Config struct {
 	Dimension int // Number of vector dimensions (e.g., 1536 for OpenAI)
 
-	IndexType IndexType // Index Selection
+	IndexType    IndexType // Index Selection
+	Quantization bool      // Enable SQ8 compression (4x RAM savings)
 
 	// HNSW Parameters
 	M              int // Max connections per node (Default: 16)
@@ -27,14 +29,19 @@ type Config struct {
 var DefaultConfig = Config{
 	Dimension:      1536,
 	IndexType:      IndexTypeFlat, // Default to Flat for small datasets
+	Quantization:   false,
 	M:              16,
 	EfConstruction: 200,
 }
 
 func (cfg *Config) GetVectorIndex() internal.VectorIndex {
 	if cfg.IndexType == IndexTypeHNSW {
+		// Future: Support HNSW + SQ8
 		return index.NewHNSWIndex(cfg.Dimension, cfg.M, cfg.EfConstruction)
-	} else {
-		return index.NewFlatIndex(cfg.Dimension)
 	}
+	// Flat Index Selection
+	if cfg.Quantization {
+		return flat.NewFlatIndexSQ8(cfg.Dimension)
+	}
+	return flat.NewFlatIndex(cfg.Dimension)
 }

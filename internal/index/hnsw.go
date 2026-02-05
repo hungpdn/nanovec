@@ -9,6 +9,7 @@ import (
 	"os"
 	"sync"
 
+	"github.com/hungpdn/nanovec/pkg/errors"
 	"github.com/hungpdn/nanovec/pkg/maths"
 	"github.com/hungpdn/nanovec/pkg/types"
 )
@@ -313,7 +314,7 @@ func (idx *HNSWIndex) AddBatch(ids []string, vecs []types.Vector, metas []map[st
 // internalAdd is the core Add logic without Locking (Helper)
 func (idx *HNSWIndex) internalAdd(id string, vec types.Vector, meta map[string]any) error {
 	if len(vec) != idx.dim {
-		return types.ErrDimMismatch
+		return errors.ErrDimMismatch
 	}
 
 	level := idx.randomLevel()
