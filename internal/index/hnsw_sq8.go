@@ -5,7 +5,6 @@ import (
 	"encoding/gob"
 	"fmt"
 	"math"
-	"math/rand"
 	"os"
 	"sync"
 
@@ -108,7 +107,7 @@ func (idx *HNSWIndexSQ8) internalAdd(id string, vec types.Vector, meta map[strin
 	maths.NormalizeInPlace(normVec)
 	qVec := maths.QuantizeSQ8(normVec)
 
-	level := idx.randomLevel()
+	level := randomLevel()
 	internalID := len(idx.nodes)
 
 	node := &hnswNodeSQ8{
@@ -150,7 +149,7 @@ func (idx *HNSWIndexSQ8) internalAdd(id string, vec types.Vector, meta map[strin
 	for l := int(math.Min(float64(level), float64(idx.maxLevel))); l >= 0; l-- {
 		// Pass normVec (Float) for searching candidates
 		candidates := idx.searchLayer(normVec, currObj, idx.EfConstruction, l)
-		neighbors := idx.selectNeighbors(candidates, idx.M)
+		neighbors := selectNeighbors(candidates, idx.M)
 		for _, neighborID := range neighbors {
 			idx.addConnection(l, internalID, neighborID)
 			idx.addConnection(l, neighborID, internalID)
@@ -343,26 +342,6 @@ func (idx *HNSWIndexSQ8) Dim() int {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 	return idx.dim
-}
-
-func (idx *HNSWIndexSQ8) randomLevel() int {
-	lvl := 0
-	for rand.Float64() < 0.5 && lvl < 10 {
-		lvl++
-	}
-	return lvl
-}
-
-func (idx *HNSWIndexSQ8) selectNeighbors(candidates []pqItem, m int) []int {
-	count := len(candidates)
-	if count > m {
-		count = m
-	}
-	out := make([]int, count)
-	for i := 0; i < count; i++ {
-		out[i] = candidates[i].id
-	}
-	return out
 }
 
 // Persistence

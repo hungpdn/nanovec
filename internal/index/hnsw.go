@@ -5,7 +5,6 @@ import (
 	"encoding/gob"
 	"fmt"
 	"math"
-	"math/rand"
 	"os"
 	"sync"
 
@@ -147,29 +146,6 @@ func (idx *HNSWIndex) searchLayer(query types.Vector, entryPoint, ef, level int)
 		finalRes[i] = heap.Pop(results).(pqItem)
 	}
 	return finalRes
-}
-
-// selectNeighbors picks the M best candidates to connect
-func (idx *HNSWIndex) selectNeighbors(candidates []pqItem, m int) []int {
-	// Candidates are already sorted Best -> Worst
-	count := len(candidates)
-	if count > m {
-		count = m
-	}
-	out := make([]int, count)
-	for i := 0; i < count; i++ {
-		out[i] = candidates[i].id
-	}
-	return out
-}
-
-// randomLevel generates a level for a new node
-func (idx *HNSWIndex) randomLevel() int {
-	lvl := 0
-	for rand.Float64() < 0.5 && lvl < 10 { // Cap level to avoid runaway
-		lvl++
-	}
-	return lvl
 }
 
 // addConnection connects two nodes at a specific level, pruning if necessary
@@ -319,7 +295,7 @@ func (idx *HNSWIndex) internalAdd(id string, vec types.Vector, meta map[string]a
 		return errors.ErrDimMismatch
 	}
 
-	level := idx.randomLevel()
+	level := randomLevel()
 	internalID := len(idx.nodes)
 
 	node := &hnswNode{
@@ -360,7 +336,7 @@ func (idx *HNSWIndex) internalAdd(id string, vec types.Vector, meta map[string]a
 
 	for l := int(math.Min(float64(level), float64(idx.maxLevel))); l >= 0; l-- {
 		candidates := idx.searchLayer(vec, currObj, idx.EfConstruction, l)
-		neighbors := idx.selectNeighbors(candidates, idx.M)
+		neighbors := selectNeighbors(candidates, idx.M)
 		for _, neighborID := range neighbors {
 			idx.addConnection(l, internalID, neighborID)
 			idx.addConnection(l, neighborID, internalID)
@@ -398,6 +374,14 @@ func (idx *HNSWIndex) Dim() int {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 	return idx.dim
+}
+
+// DTO for serialization since hnswNode has unexported fields
+type hnswNodeDTO struct {
+	ID        string
+	Vec       types.Vector
+	Level     int
+	Neighbors [][]int
 }
 
 // Atomic Save for HNSW
@@ -513,51 +497,4 @@ func (idx *HNSWIndex) Load(path string) error {
 	}
 
 	return nil
-}
-
-// DTO for serialization since hnswNode has unexported fields
-type hnswNodeDTO struct {
-	ID        string
-	Vec       types.Vector
-	Level     int
-	Neighbors [][]int
-}
-
-// --- Priority Queues Helpers ---
-
-type pqItem struct {
-	id    int
-	score float32
-}
-
-// MinHeap: Keeps the LOWEST score at top.
-// Used for "Results Buffer" -> We want to keep High Scores. If buffer full, remove Lowest.
-type MinHeap []pqItem
-
-func (h MinHeap) Len() int           { return len(h) }
-func (h MinHeap) Less(i, j int) bool { return h[i].score < h[j].score } // Min-Heap
-func (h MinHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *MinHeap) Push(x any)        { *h = append(*h, x.(pqItem)) }
-func (h *MinHeap) Pop() any {
-	old := *h
-	n := len(old)
-	x := old[n-1]
-	*h = old[0 : n-1]
-	return x
-}
-
-// MaxHeap: Keeps the HIGHEST score at top.
-// Used for "Candidates to Explore" -> We want to explore Best (Closest) nodes first.
-type MaxHeap []pqItem
-
-func (h MaxHeap) Len() int           { return len(h) }
-func (h MaxHeap) Less(i, j int) bool { return h[i].score > h[j].score } // Max-Heap (> instead of <)
-func (h MaxHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *MaxHeap) Push(x any)        { *h = append(*h, x.(pqItem)) }
-func (h *MaxHeap) Pop() any {
-	old := *h
-	n := len(old)
-	x := old[n-1]
-	*h = old[0 : n-1]
-	return x
 }
