@@ -309,13 +309,24 @@ func (db *DB) Close() error {
 
 // Vacuum rebuilds the vector index from scratch to remove "ghost nodes" (deleted items)
 // and optimize memory usage. It mimics SQLite's VACUUM command.
-// This is a blocking operation and should be called periodically or during maintenance windows.
+//
+// ⚠️ BLOCKING OPERATION: This function holds a global lock (Stop-the-World) during the
+// entire rebuild process. For a 1GB dataset, this might take 10-20 seconds.
+//
+// Recommendation: Run this function asynchronously or during maintenance windows.
 func (db *DB) Vacuum() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
 	log.Println("🧹 Starting VACUUM (Rebuilding Index)...")
 	start := time.Now()
+
+	docCount, _ := db.storage.Count()
+	if docCount > 10000 {
+		log.Printf("🧹 VACUUM started on %d items. System will be BLOCKED until completion...", docCount)
+	} else {
+		log.Println("🧹 VACUUM started...")
+	}
 
 	// 1. Create a fresh, empty Index (Snapshot configuration from current)
 	// New index starts with 0 nodes, effectively removing all ghosts.
