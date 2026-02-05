@@ -38,6 +38,7 @@ func newSearchCtx(neighborCap int) *searchCtx {
 	}
 }
 
+// reset clears the search context for reuse
 func (ctx *searchCtx) reset() {
 	*ctx.candidates = (*ctx.candidates)[:0]
 	*ctx.results = (*ctx.results)[:0]
@@ -117,24 +118,28 @@ func (idx *HNSWIndex[T]) selectNeighborsFromHeap(ctx *searchCtx, h *MinHeap, m i
 	return ctx.neighborBuf[start:]
 }
 
+// Count returns the number of indexed vectors
 func (idx *HNSWIndex[T]) Count() int {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 	return len(idx.idMap)
 }
 
+// Dim returns the dimension of indexed vectors
 func (idx *HNSWIndex[T]) Dim() int {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 	return idx.dim
 }
 
+// SetVersion sets the index version
 func (idx *HNSWIndex[T]) SetVersion(v uint64) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 	idx.Version = v
 }
 
+// GetVersion returns the index version
 func (idx *HNSWIndex[T]) GetVersion() uint64 {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()

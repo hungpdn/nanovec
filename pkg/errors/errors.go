@@ -12,6 +12,6 @@ var (
 	// ErrIDAlreadyExists can be added if you want a standardized error for duplicates
 	ErrIDAlreadyExists = errors.New("id already exists")
 
-	// ErrBatchSizeMismatch
+	// ErrBatchSizeMismatch is returned when the number of IDs does not match the number of vectors in a batch operation.
 	ErrBatchSizeMismatch = errors.New("batch size mismatch")
 )

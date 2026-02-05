@@ -67,6 +67,7 @@ func (s *BoltStorage) SyncDocCount() error {
 	})
 }
 
+// GetVersion returns the current database version
 func (s *BoltStorage) GetVersion() (uint64, error) {
 	var ver uint64
 	err := s.db.View(func(tx *bbolt.Tx) error {
@@ -304,10 +305,12 @@ func (s *BoltStorage) Count() (int, error) {
 	return count, err
 }
 
+// Close closes the database
 func (s *BoltStorage) Close() error {
 	return s.db.Close()
 }
 
+// bufferPool is used to reduce allocations during serialization
 var bufferPool = sync.Pool{
 	New: func() any {
 		return new(bytes.Buffer)

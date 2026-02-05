@@ -5,6 +5,7 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+
 - Initial implementation of Flat Index (Float32 & SQ8).
 - Initial implementation of HNSW Index (Graph-based search).
 - Persistence layer using bbolt (WAL support).
@@ -13,4 +14,5 @@ All notable changes to this project will be documented in this file.
 - `Vacuum` method for storage optimization.
 
 ### Fixed
+
 - Rounding error in SQ8 quantization logic.

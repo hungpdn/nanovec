@@ -4,12 +4,12 @@ Thank you for your interest in contributing to Nanovec! We welcome contributions
 
 ## How to Contribute
 
-1.  **Fork the repository** on GitHub.
-2.  **Clone your fork** locally.
-3.  **Create a new branch** for your feature or bug fix (`git checkout -b feature/amazing-feature`).
-4.  **Commit your changes** with clear messages.
-5.  **Push to your fork** (`git push origin feature/amazing-feature`).
-6.  **Open a Pull Request** to the `main` branch.
+1. **Fork the repository** on GitHub.
+2. **Clone your fork** locally.
+3. **Create a new branch** for your feature or bug fix (`git checkout -b feature/amazing-feature`).
+4. **Commit your changes** with clear messages.
+5. **Push to your fork** (`git push origin feature/amazing-feature`).
+6. **Open a Pull Request** to the `main` branch.
 
 ## Coding Guidelines
 
@@ -20,6 +20,7 @@ Thank you for your interest in contributing to Nanovec! We welcome contributions
 ## Reporting Bugs
 
 Please use the GitHub Issue Tracker to report bugs. Include:
+
 * Your OS and Go version.
 * A minimal reproduction code snippet.
 * Expected vs. actual behavior.

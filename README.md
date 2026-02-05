@@ -26,30 +26,29 @@ go get github.com/hungpdn/nanovec
 package main
 
 import (
-	"fmt"
-	"log"
-	"github.com/hungpdn/nanovec"
+    "fmt"
+    "log"
+    "github.com/hungpdn/nanovec"
 )
 
 func main() {
-	// Open database
-	cfg := nanovec.Config{
-		Dimension: 3,
-		IndexType: nanovec.IndexTypeHNSW,
-	}
-	db, _ := nanovec.Open("mydata.db", &cfg)
-	defer db.Close()
+    // Open database
+    cfg := nanovec.Config{
+        Dimension: 3,
+        IndexType: nanovec.IndexTypeHNSW,
+    }
+    db, _ := nanovec.Open("mydata.db", &cfg)
+    defer db.Close()
 
-	// Insert
-	_ = db.Insert("vec1", []float32{1.0, 0.0, 0.0}, map[string]any{"tag": "A"})
+    // Insert
+    _ = db.Insert("vec1", []float32{1.0, 0.0, 0.0}, map[string]any{"tag": "A"})
 
-	// Search
-	results, _ := db.Search([]float32{1.0, 0.0, 0.0}, 1, nil)
-	fmt.Printf("Found: %s\n", results[0].ID)
+    // Search
+    results, _ := db.Search([]float32{1.0, 0.0, 0.0}, 1, nil)
+    fmt.Printf("Found: %s\n", results[0].ID)
 }
 
 ```
-
 
 ## Benchmarks
 
@@ -87,7 +86,7 @@ MIT License
 
 ## References
 
-- [bbolt](https://github.com/etcd-io/bbolt)
-- [HNSW Paper](https://arxiv.org/abs/1603.09320)
-- [HNSW in Pinecone](https://www.pinecone.io/learn/series/faiss/hnsw/)
-- [Faiss](https://github.com/facebookresearch/faiss)
+* [bbolt](https://github.com/etcd-io/bbolt)
+* [HNSW Paper](https://arxiv.org/abs/1603.09320)
+* [HNSW in Pinecone](https://www.pinecone.io/learn/series/faiss/hnsw/)
+* [Faiss](https://github.com/facebookresearch/faiss)
