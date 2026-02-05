@@ -68,9 +68,7 @@ func Open(path string, cfg *Config) (*DB, error) {
 		fmt.Printf("⚠️ %s. Rebuilding from Storage...\n", reason)
 
 		// Reset Index to clean state before rebuilding
-		// (Important if we had a partial/stale index loaded)
 		if idx.Count() > 0 {
-			// Since we don't have a Clear() method, we just re-init
 			db.index = cfg.GetVectorIndex()
 		}
 
@@ -129,11 +127,10 @@ func (db *DB) Insert(id string, vec []float32, meta map[string]any) error {
 		return fmt.Errorf("storage write failed: %v", err)
 	}
 
-	// Note: If this fails (e.g. OOM), the DB is in a "Storage-Index mismatch" state.
-	// A WAL replay on restart would fix this.
 	_ = db.index.Delete(id)
 	if err := db.index.Add(id, types.Vector(vec), meta); err != nil {
-		return err
+		_ = db.storage.Delete(id)
+		return fmt.Errorf("index add failed (rolled back storage): %v", err)
 	}
 
 	return nil
@@ -148,6 +145,7 @@ func (db *DB) InsertBatch(ids []string, vecs [][]float32, metas []map[string]any
 		return errors.ErrBatchSizeMismatch
 	}
 
+	docs := make([]*types.Document, len(ids))
 	typeVectors := make([]types.Vector, len(vecs))
 
 	for i, id := range ids {
@@ -156,14 +154,15 @@ func (db *DB) InsertBatch(ids []string, vecs [][]float32, metas []map[string]any
 		}
 		typeVectors[i] = types.Vector(vecs[i])
 
-		doc := &types.Document{
+		docs[i] = &types.Document{
 			ID:       id,
 			Vector:   typeVectors[i],
 			Metadata: metas[i],
 		}
-		if err := db.storage.Put(doc); err != nil {
-			return fmt.Errorf("storage batch write failed at index %d: %v", i, err)
-		}
+	}
+
+	if err := db.storage.PutBatch(docs); err != nil {
+		return fmt.Errorf("storage batch write failed: %v", err)
 	}
 
 	for _, id := range ids {
@@ -171,6 +170,8 @@ func (db *DB) InsertBatch(ids []string, vecs [][]float32, metas []map[string]any
 	}
 
 	if err := db.index.AddBatch(ids, typeVectors, metas); err != nil {
+		// Note: We don't rollback storage here as it's complex for batches.
+		// The Open() self-healing will fix this sync drift on restart.
 		return fmt.Errorf("index batch update failed: %v", err)
 	}
 
@@ -178,7 +179,6 @@ func (db *DB) InsertBatch(ids []string, vecs [][]float32, metas []map[string]any
 }
 
 // Search finds similar vectors
-// filter: Optional function to check metadata. Return true to include, false to exclude.
 func (db *DB) Search(query []float32, k int, filter types.FilterFunc) ([]types.SearchResult, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
@@ -205,7 +205,6 @@ func (db *DB) Update(id string, newVec []float32, newMeta map[string]any) error 
 	}
 
 	finalVec := oldDoc.Vector
-
 	if len(newVec) > 0 {
 		finalVec = types.Vector(newVec)
 	}
@@ -227,7 +226,9 @@ func (db *DB) Update(id string, newVec []float32, newMeta map[string]any) error 
 
 	_ = db.index.Delete(id)
 	if err := db.index.Add(id, finalVec, finalMeta); err != nil {
-		return err
+		// Attempt to restore old doc to storage
+		_ = db.storage.Put(oldDoc)
+		return fmt.Errorf("index update failed (rolled back storage): %v", err)
 	}
 
 	return nil
@@ -249,11 +250,10 @@ func (db *DB) Delete(id string) error {
 	return nil
 }
 
-// Exists checks if a document ID exists in the database.
+// Exists checks if a document ID exists
 func (db *DB) Exists(id string) bool {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-
 	return db.storage.Has(id)
 }
 

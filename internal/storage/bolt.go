@@ -50,6 +50,29 @@ func (s *BoltStorage) Put(doc *types.Document) error {
 	})
 }
 
+// PutBatch saves multiple documents in a SINGLE transaction (High Performance)
+func (s *BoltStorage) PutBatch(docs []*types.Document) error {
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket([]byte(bucketName))
+
+		// Reuse buffer to reduce allocations
+		var buf bytes.Buffer
+
+		for _, doc := range docs {
+			buf.Reset()
+			enc := gob.NewEncoder(&buf)
+			if err := enc.Encode(doc); err != nil {
+				return fmt.Errorf("failed to encode document %s: %w", doc.ID, err)
+			}
+
+			if err := b.Put([]byte(doc.ID), buf.Bytes()); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 // Get read document from disk
 func (s *BoltStorage) Get(id string) (*types.Document, error) {
 	var doc types.Document
