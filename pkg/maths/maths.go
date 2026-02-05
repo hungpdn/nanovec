@@ -68,13 +68,12 @@ func DotProduct(a, b []float32) float32 {
 }
 
 // DotProductSQ8 calculates dot product optimized using Distributive Property
-// Speedup: ~1.5x - 2x compared to the naive safe version.
 func DotProductSQ8(query []float32, qVec []uint8) float32 {
 	if len(query) != len(qVec) || len(query) == 0 {
 		return 0
 	}
 
-	// 1. Calculate sum of query vector (Overhead is negligible)
+	// Calculate sum of query vector (Overhead is negligible)
 	var querySum float32
 	for _, v := range query {
 		querySum += v
@@ -87,7 +86,7 @@ func DotProductSQ8(query []float32, qVec []uint8) float32 {
 	_ = query[n-1]
 	_ = qVec[n-1]
 
-	// 2. Accumulate Cross-Product (q * u)
+	// Accumulate Cross-Product (q * u)
 	// We accumulate in float32, so NO integer overflow risk.
 	for ; i <= n-4; i += 4 {
 		sumProd += query[i]*float32(qVec[i]) +
@@ -100,7 +99,7 @@ func DotProductSQ8(query []float32, qVec []uint8) float32 {
 		sumProd += query[i] * float32(qVec[i])
 	}
 
-	// 3. Apply formula: S * sum(q*u) - sum(q)
+	// Apply formula: S * sum(q*u) - sum(q)
 	return (sumProd * InvScale) - querySum
 }
 

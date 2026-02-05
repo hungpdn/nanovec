@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/hungpdn/nanovec"
+	"github.com/hungpdn/nanovec/internal/index"
 )
 
 // Helper to assert errors
@@ -307,6 +308,105 @@ func TestDeleteConsistency(t *testing.T) {
 		assertNoError(t, err, "Search")
 		if len(results) != 0 {
 			t.Errorf("Expected 0 results for deleted item, got %d", len(results))
+		}
+	}()
+}
+
+func TestConfig_GetVectorIndex(t *testing.T) {
+	tests := []struct {
+		name         string
+		cfg          nanovec.Config
+		expectedType string // "FlatFloat", "FlatSQ8", "HNSWFloat", "HNSWSQ8"
+	}{
+		{
+			name:         "Default Flat Float",
+			cfg:          nanovec.Config{IndexType: nanovec.IndexTypeFlat, Quantization: false, Dimension: 128},
+			expectedType: "FlatFloat",
+		},
+		{
+			name:         "Flat SQ8",
+			cfg:          nanovec.Config{IndexType: nanovec.IndexTypeFlat, Quantization: true, Dimension: 128},
+			expectedType: "FlatSQ8",
+		},
+		{
+			name:         "HNSW Float",
+			cfg:          nanovec.Config{IndexType: nanovec.IndexTypeHNSW, Quantization: false, Dimension: 128, M: 16, EfConstruction: 200},
+			expectedType: "HNSWFloat",
+		},
+		{
+			name:         "HNSW SQ8",
+			cfg:          nanovec.Config{IndexType: nanovec.IndexTypeHNSW, Quantization: true, Dimension: 128, M: 16, EfConstruction: 200},
+			expectedType: "HNSWSQ8",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			idx := tt.cfg.GetVectorIndex()
+
+			var actualType string
+			switch idx.(type) {
+			case *index.FlatIndex[float32]:
+				actualType = "FlatFloat"
+			case *index.FlatIndex[uint8]:
+				actualType = "FlatSQ8"
+			case *index.HNSWIndex[float32]:
+				actualType = "HNSWFloat"
+			case *index.HNSWIndex[uint8]:
+				actualType = "HNSWSQ8"
+			default:
+				t.Fatalf("Unknown index type returned")
+			}
+
+			if actualType != tt.expectedType {
+				t.Errorf("Expected %s, got %s", tt.expectedType, actualType)
+			}
+		})
+	}
+}
+
+func TestDB_Vacuum(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "vacuum_test")
+	cfg := &nanovec.Config{Dimension: 2}
+
+	// 1. Setup Data
+	func() {
+		db, err := nanovec.Open(dbPath, cfg)
+		assertNoError(t, err, "Open DB")
+		defer db.Close()
+
+		// Insert 3 items
+		_ = db.Insert("A", []float32{1, 0}, nil)
+		_ = db.Insert("B", []float32{0, 1}, nil)
+		_ = db.Insert("C", []float32{1, 1}, nil)
+
+		// Delete B
+		_ = db.Delete("B")
+
+		// Run Vacuum
+		if err := db.Vacuum(); err != nil {
+			t.Fatalf("Vacuum failed: %v", err)
+		}
+
+		// Verify internal integrity immediately
+		if db.Exists("B") {
+			t.Error("Deleted item 'B' resurrected after Vacuum")
+		}
+		if !db.Exists("A") || !db.Exists("C") {
+			t.Error("Valid items lost after Vacuum")
+		}
+	}()
+
+	// 2. Restart & Verify Persistence
+	func() {
+		db, err := nanovec.Open(dbPath, cfg)
+		assertNoError(t, err, "Re-Open DB")
+		defer db.Close()
+
+		results, _ := db.Search([]float32{1, 0}, 5, nil)
+		if len(results) != 2 { // Should be A and C only
+			t.Errorf("Expected 2 results after Vacuum+Restart, got %d", len(results))
 		}
 	}()
 }
