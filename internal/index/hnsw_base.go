@@ -1,7 +1,6 @@
 package index
 
 import (
-	"container/heap"
 	"math/rand/v2"
 )
 
@@ -10,31 +9,32 @@ import (
 type searchCtx struct {
 	// visitedList stores the "visit token" for each node internal ID
 	visitedList  []uint32
-	visitedToken uint32 // Current search generation
-	candidates   *MaxHeap
-	results      *MinHeap
+	visitedToken uint32   // Current search generation
+	candidates   *maxHeap // maxHeap for candidates
+	results      *minHeap // minHeap for results: Pop lowest score (worst in top-k) to replace
 	// Scratch buffer for neighbor selection to avoid allocations
 	neighborBuf []int
+	// Scratch buffer for reading neighbors safely inside RLock without alloc
+	scratchNeighbors []int
 	// Thread-local RNG to avoid global lock contention
 	rng *rand.Rand
 }
 
 func newSearchCtx(neighborCap int) *searchCtx {
-	c := &MaxHeap{}
-	r := &MinHeap{}
-	heap.Init(c)
-	heap.Init(r)
+	c := make(maxHeap, 0, 256)
+	r := make(minHeap, 0, 256)
 
 	// Initialize a thread-local RNG
 	rSource := rand.NewPCG(rand.Uint64(), rand.Uint64())
 
 	return &searchCtx{
-		visitedList:  make([]uint32, 0),
-		visitedToken: 0,
-		candidates:   c,
-		results:      r,
-		neighborBuf:  make([]int, 0, neighborCap),
-		rng:          rand.New(rSource),
+		visitedList:      make([]uint32, 0),
+		visitedToken:     0,
+		candidates:       &c,
+		results:          &r,
+		neighborBuf:      make([]int, 0, neighborCap),
+		scratchNeighbors: make([]int, 0, neighborCap),
+		rng:              rand.New(rSource),
 	}
 }
 
@@ -48,7 +48,6 @@ func (ctx *searchCtx) reset() {
 // This avoids contention on the global math/rand mutex.
 func (ctx *searchCtx) randomLevel() int {
 	lvl := 0
-	// ctx.rng.Float64() is strictly local to this goroutine/context -> No Lock needed.
 	for ctx.rng.Float64() < 0.5 && lvl < 10 {
 		lvl++
 	}
@@ -60,100 +59,132 @@ type pqItem struct {
 	score float32
 }
 
-// MinHeap: Keeps the LOWEST score at top
-type MinHeap []pqItem
+// minHeap: Keeps the LOWEST score at top (root).
+// Used for "Results" list (Top-K). We want to easily remove the worst item (min score) if we find a better one.
+type minHeap []pqItem
 
-func (h MinHeap) Len() int           { return len(h) }
-func (h MinHeap) Less(i, j int) bool { return h[i].score < h[j].score }
-func (h MinHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *MinHeap) Push(x any)        { *h = append(*h, x.(pqItem)) }
-func (h *MinHeap) Pop() any {
+func (h minHeap) Len() int { return len(h) }
+
+func (h *minHeap) Push(x pqItem) {
+	*h = append(*h, x)
+	h.up(len(*h) - 1)
+}
+
+func (h *minHeap) Pop() pqItem {
 	old := *h
 	n := len(old)
-	x := old[n-1]
+	item := old[n-1]
 	*h = old[0 : n-1]
-	return x
+	if n > 1 {
+		root := old[0]
+		(*h)[0] = item
+		h.down(0, len(*h))
+		return root
+	}
+	return item
 }
 
-// MaxHeap: Keeps the HIGHEST score at top
-type MaxHeap []pqItem
+// Peek returns the smallest element (root) without removing it
+func (h minHeap) Peek() pqItem {
+	if len(h) == 0 {
+		return pqItem{}
+	}
+	return h[0]
+}
 
-func (h MaxHeap) Len() int           { return len(h) }
-func (h MaxHeap) Less(i, j int) bool { return h[i].score > h[j].score }
-func (h MaxHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *MaxHeap) Push(x any)        { *h = append(*h, x.(pqItem)) }
-func (h *MaxHeap) Pop() any {
+func (h *minHeap) up(j int) {
+	for {
+		i := (j - 1) / 2 // parent
+		if i == j || !((*h)[j].score < (*h)[i].score) {
+			break
+		}
+		(*h)[j], (*h)[i] = (*h)[i], (*h)[j]
+		j = i
+	}
+}
+
+func (h *minHeap) down(i0, n int) {
+	i := i0
+	for {
+		j1 := 2*i + 1
+		if j1 >= n || j1 < 0 {
+			break
+		}
+		j := j1
+		j2 := j1 + 1
+		if j2 < n && (*h)[j2].score < (*h)[j1].score {
+			j = j2
+		}
+		if !((*h)[j].score < (*h)[i].score) {
+			break
+		}
+		(*h)[i], (*h)[j] = (*h)[j], (*h)[i]
+		i = j
+	}
+}
+
+// maxHeap: Keeps the HIGHEST score at top (root).
+// Used for "Candidates" (Beam Search). We want to process the best (closest) node first.
+type maxHeap []pqItem
+
+func (h maxHeap) Len() int { return len(h) }
+
+func (h *maxHeap) Push(x pqItem) {
+	*h = append(*h, x)
+	h.up(len(*h) - 1)
+}
+
+func (h *maxHeap) Pop() pqItem {
 	old := *h
 	n := len(old)
-	x := old[n-1]
+	if n == 0 {
+		return pqItem{}
+	}
+	root := old[0]
+	last := old[n-1]
 	*h = old[0 : n-1]
-	return x
-}
 
-// Helper for selecting neighbors from heap
-func (idx *HNSWIndex[T]) selectNeighborsFromHeap(ctx *searchCtx, h *MinHeap, m int) []int {
-	count := h.Len()
-
-	// 1. Reset buffer length
-	ctx.neighborBuf = ctx.neighborBuf[:0]
-
-	// 2. Grow capacity if needed (rarely happens if initialized with > M)
-	if cap(ctx.neighborBuf) < count {
-		ctx.neighborBuf = make([]int, 0, count)
+	if n > 1 {
+		(*h)[0] = last
+		h.down(0, len(*h))
 	}
+	return root
+}
 
-	// 3. Fill buffer by popping from heap
-	// Note: We consume the heap, but it's fine since ctx is reset per layer
-	for i := 0; i < count; i++ {
-		ctx.neighborBuf = append(ctx.neighborBuf, heap.Pop(h).(pqItem).id)
+func (h maxHeap) Peek() pqItem {
+	if len(h) == 0 {
+		return pqItem{}
 	}
+	return h[0]
+}
 
-	// 4. Select best candidates (last M items because MinHeap pop order is Worst -> Best)
-	start := 0
-	if count > m {
-		start = count - m
+func (h *maxHeap) up(j int) {
+	for {
+		i := (j - 1) / 2
+		if i == j || !((*h)[j].score > (*h)[i].score) { // Greater than
+			break
+		}
+		(*h)[j], (*h)[i] = (*h)[i], (*h)[j]
+		j = i
 	}
-
-	// Return a slice backing the reusable buffer
-	return ctx.neighborBuf[start:]
 }
 
-// Count returns the number of indexed vectors
-func (idx *HNSWIndex[T]) Count() int {
-	idx.mu.RLock()
-	defer idx.mu.RUnlock()
-	return len(idx.idMap)
-}
-
-// Dim returns the dimension of indexed vectors
-func (idx *HNSWIndex[T]) Dim() int {
-	idx.mu.RLock()
-	defer idx.mu.RUnlock()
-	return idx.dim
-}
-
-// SetVersion sets the index version
-func (idx *HNSWIndex[T]) SetVersion(v uint64) {
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
-	idx.Version = v
-}
-
-// GetVersion returns the index version
-func (idx *HNSWIndex[T]) GetVersion() uint64 {
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
-	return idx.Version
-}
-
-// DeletedCount returns the number of ghost nodes (marked in tombstones)
-func (idx *HNSWIndex[T]) DeletedCount() int {
-	idx.mu.RLock()
-	defer idx.mu.RUnlock()
-	return idx.tombstones.CountSetBits()
-}
-
-// Close cleans up resources
-func (idx *HNSWIndex[T]) Close() error {
-	return nil
+func (h *maxHeap) down(i0, n int) {
+	i := i0
+	for {
+		j1 := 2*i + 1
+		if j1 >= n || j1 < 0 {
+			break
+		}
+		j := j1
+		j2 := j1 + 1
+		if j2 < n && (*h)[j2].score > (*h)[j1].score { // Greater than
+			j = j2
+		}
+		if !((*h)[j].score > (*h)[i].score) { // Greater than
+			break
+		}
+		(*h)[i], (*h)[j] = (*h)[j], (*h)[i]
+		i = j
+	}
 }

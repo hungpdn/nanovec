@@ -93,5 +93,17 @@ func (b *BitSet) Load(r io.Reader) error {
 	}
 
 	b.data = make([]uint64, dataLen)
-	return binary.Read(r, binary.LittleEndian, &b.data)
+	byteSize := int(dataLen) * 8
+	rawBytes := make([]byte, byteSize)
+
+	if _, err := io.ReadFull(r, rawBytes); err != nil {
+		return err
+	}
+
+	for i := 0; i < int(dataLen); i++ {
+		offset := i * 8
+		b.data[i] = binary.LittleEndian.Uint64(rawBytes[offset : offset+8])
+	}
+
+	return nil
 }

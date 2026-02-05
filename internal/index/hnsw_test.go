@@ -1,7 +1,6 @@
 package index
 
 import (
-	"container/heap"
 	"fmt"
 	"math/rand"
 	"path/filepath"
@@ -180,25 +179,24 @@ func TestHNSW_SQ8(t *testing.T) {
 func TestHeaps(t *testing.T) {
 	// 1. MinHeap Test (The smallest score is at the top)
 	t.Run("MinHeap", func(t *testing.T) {
-		h := &MinHeap{}
-		heap.Init(h)
+		h := &minHeap{}
 
 		// Messy push
-		heap.Push(h, pqItem{id: 1, score: 0.5})
-		heap.Push(h, pqItem{id: 2, score: 0.1}) // Smallest
-		heap.Push(h, pqItem{id: 3, score: 0.9})
+		h.Push(pqItem{id: 1, score: 0.5})
+		h.Push(pqItem{id: 2, score: 0.1}) // Smallest
+		h.Push(pqItem{id: 3, score: 0.9})
 
 		if h.Len() != 3 {
 			t.Errorf("Expected len 3, got %d", h.Len())
 		}
 
 		// Pop: Expect 0.1 -> 0.5 -> 0.9
-		first := heap.Pop(h).(pqItem)
+		first := h.Pop()
 		if first.score != 0.1 {
 			t.Errorf("MinHeap Failed: expected 0.1, got %f", first.score)
 		}
 
-		second := heap.Pop(h).(pqItem)
+		second := h.Pop()
 		if second.score != 0.5 {
 			t.Errorf("MinHeap Failed: expected 0.5, got %f", second.score)
 		}
@@ -206,38 +204,16 @@ func TestHeaps(t *testing.T) {
 
 	// 2. Test MaxHeap (The highest score is at the top)
 	t.Run("MaxHeap", func(t *testing.T) {
-		h := &MaxHeap{}
-		heap.Init(h)
+		h := &maxHeap{}
 
-		heap.Push(h, pqItem{id: 1, score: 0.5})
-		heap.Push(h, pqItem{id: 2, score: 0.1})
-		heap.Push(h, pqItem{id: 3, score: 0.9}) // Biggest
+		h.Push(pqItem{id: 1, score: 0.5})
+		h.Push(pqItem{id: 2, score: 0.1})
+		h.Push(pqItem{id: 3, score: 0.9}) // Biggest
 
 		// Pop: Expect 0.9 -> 0.5 -> 0.1
-		first := heap.Pop(h).(pqItem)
+		first := h.Pop()
 		if first.score != 0.9 {
 			t.Errorf("MaxHeap Failed: expected 0.9, got %f", first.score)
 		}
 	})
-}
-
-func BenchmarkHNSW_Search_Float(b *testing.B) {
-	dim := 128
-	idx := NewHNSWIndexFloat(dim, 16, 200)
-
-	// Setup: Insert 10k vectors
-	ids := make([]string, 10000)
-	vecs := make([]types.Vector, 10000)
-	for i := 0; i < 10000; i++ {
-		ids[i] = fmt.Sprintf("id_%d", i)
-		vecs[i] = randomVector(dim)
-	}
-	_ = idx.AddBatch(ids, vecs, make([]map[string]any, 10000))
-
-	query := randomVector(dim)
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		_, _ = idx.Search(query, 10, nil)
-	}
 }

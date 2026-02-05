@@ -2,7 +2,6 @@ package index
 
 import (
 	"fmt"
-	"math/rand"
 	"testing"
 
 	"github.com/hungpdn/nanovec/pkg/types"
@@ -24,16 +23,6 @@ PASS
 ok  	github.com/hungpdn/nanovec/internal/index	22.994s
 */
 
-// ensureRandomVector helper is available if running standalone
-// (If you already have this in hnsw_test.go within the same package, you can remove this function)
-func ensureRandomVector(dim int) types.Vector {
-	vec := make(types.Vector, dim)
-	for i := 0; i < dim; i++ {
-		vec[i] = rand.Float32()
-	}
-	return vec
-}
-
 const (
 	BenchDim   = 128
 	BenchCount = 100000 // 100k vectors for search benchmark
@@ -52,13 +41,13 @@ func BenchmarkFlat_Search_Float32(b *testing.B) {
 
 	for i := 0; i < BenchCount; i++ {
 		ids[i] = fmt.Sprintf("vec_%d", i)
-		vecs[i] = ensureRandomVector(BenchDim)
+		vecs[i] = randomVector(BenchDim)
 	}
 
 	// Bulk Insert
 	_ = idx.AddBatch(ids, vecs, metas)
 
-	query := ensureRandomVector(BenchDim)
+	query := randomVector(BenchDim)
 	b.ResetTimer()
 
 	// Run Benchmark
@@ -79,12 +68,12 @@ func BenchmarkFlat_Search_SQ8(b *testing.B) {
 
 	for i := 0; i < BenchCount; i++ {
 		ids[i] = fmt.Sprintf("vec_%d", i)
-		vecs[i] = ensureRandomVector(BenchDim)
+		vecs[i] = randomVector(BenchDim)
 	}
 
 	_ = idx.AddBatch(ids, vecs, metas)
 
-	query := ensureRandomVector(BenchDim)
+	query := randomVector(BenchDim)
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
@@ -103,7 +92,7 @@ func BenchmarkFlat_InsertBatch(b *testing.B) {
 
 	for i := 0; i < batchSize; i++ {
 		ids[i] = fmt.Sprintf("id_%d", i)
-		vecs[i] = ensureRandomVector(BenchDim)
+		vecs[i] = randomVector(BenchDim)
 	}
 
 	b.ResetTimer()
@@ -131,11 +120,11 @@ func BenchmarkFlat_Search_Concurrent(b *testing.B) {
 
 	for i := 0; i < count; i++ {
 		ids[i] = fmt.Sprintf("%d", i)
-		vecs[i] = ensureRandomVector(BenchDim)
+		vecs[i] = randomVector(BenchDim)
 	}
 	_ = idx.AddBatch(ids, vecs, metas)
 
-	query := ensureRandomVector(BenchDim)
+	query := randomVector(BenchDim)
 	b.ResetTimer()
 
 	b.RunParallel(func(pb *testing.PB) {
@@ -160,12 +149,12 @@ func BenchmarkFlat_UpdateVector(b *testing.B) {
 
 	for i := 0; i < BenchCount; i++ {
 		ids[i] = fmt.Sprintf("vec_%d", i)
-		vecs[i] = ensureRandomVector(BenchDim)
+		vecs[i] = randomVector(BenchDim)
 	}
 	_ = idx.AddBatch(ids, vecs, metas)
 
 	// Pre-allocate a replacement vector to avoid allocation noise during bench
-	updateVec := ensureRandomVector(BenchDim)
+	updateVec := randomVector(BenchDim)
 
 	b.ResetTimer()
 
@@ -201,7 +190,7 @@ func BenchmarkFlat_UpdateMetadata(b *testing.B) {
 
 	for i := 0; i < BenchCount; i++ {
 		ids[i] = fmt.Sprintf("vec_%d", i)
-		vecs[i] = ensureRandomVector(BenchDim)
+		vecs[i] = randomVector(BenchDim)
 		metas[i] = map[string]any{"v": 0}
 	}
 	_ = idx.AddBatch(ids, vecs, metas)

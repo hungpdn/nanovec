@@ -3,7 +3,6 @@ package index
 import (
 	"bufio"
 	"cmp"
-	"container/heap"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -13,6 +12,7 @@ import (
 	"runtime"
 	"slices"
 	"sync"
+	"unsafe"
 
 	"github.com/hungpdn/nanovec/pkg/bitset"
 	"github.com/hungpdn/nanovec/pkg/maths"
@@ -66,7 +66,7 @@ type Node[T types.Number] struct {
 
 // NewHNSWIndexFloat creates a standard Float32 HNSW index
 func NewHNSWIndexFloat(dim, m, efConstruction int) *HNSWIndex[float32] {
-	idx := &HNSWIndex[float32]{
+	return &HNSWIndex[float32]{
 		dim:            dim,
 		M:              m,
 		MMax0:          m * 2,
@@ -89,12 +89,11 @@ func NewHNSWIndexFloat(dim, m, efConstruction int) *HNSWIndex[float32] {
 		},
 		searchCtxPool: &sync.Pool{New: func() any { return newSearchCtx(m * 2) }},
 	}
-	return idx
 }
 
 // NewHNSWIndexSQ8 creates a sq8 HNSW index
 func NewHNSWIndexSQ8(dim, m, efConstruction int) *HNSWIndex[uint8] {
-	idx := &HNSWIndex[uint8]{
+	return &HNSWIndex[uint8]{
 		dim:            dim,
 		M:              m,
 		MMax0:          m * 2,
@@ -118,7 +117,6 @@ func NewHNSWIndexSQ8(dim, m, efConstruction int) *HNSWIndex[uint8] {
 		},
 		searchCtxPool: &sync.Pool{New: func() any { return newSearchCtx(m * 2) }},
 	}
-	return idx
 }
 
 // Add inserts a single vector
@@ -146,12 +144,22 @@ func (idx *HNSWIndex[T]) Add(id string, vec types.Vector, meta map[string]any) e
 	}
 
 	level := ctx.randomLevel()
+
+	neighbors := make([][]int, level+1)
+	for i := 0; i <= level; i++ {
+		cap := idx.M
+		if i == 0 {
+			cap = idx.MMax0
+		}
+		neighbors[i] = make([]int, 0, cap)
+	}
+
 	node := &Node[T]{
 		ID:        id,
 		Vec:       storedVec,
 		VecSum:    vecSum,
 		Level:     level,
-		Neighbors: make([][]int, level+1),
+		Neighbors: neighbors,
 	}
 
 	// Update Global State
@@ -176,7 +184,10 @@ func (idx *HNSWIndex[T]) Add(id string, vec types.Vector, meta map[string]any) e
 
 	// Phase 2: Parallel Linking (Fine-Grained)
 	idx.mu.RLock()
-	idx.parallelLink(ctx, node, navQuery)
+	distFunc := func(nodeIdx int) float32 {
+		return idx.distQueryFunc(navQuery, idx.nodes[nodeIdx].Vec)
+	}
+	idx.parallelLink(ctx, node, distFunc)
 	idx.mu.RUnlock()
 
 	// Phase 3: Finalize state (global lock)
@@ -211,7 +222,9 @@ func (idx *HNSWIndex[T]) AddBatch(ids []string, vecs []types.Vector, metas []map
 
 	rngCtx := idx.searchCtxPool.Get().(*searchCtx)
 
+	nodeArena := make([]Node[T], count)
 	newNodes := make([]*Node[T], count)
+	vecArena := make([]T, count*idx.dim)
 	flatBuf := make([]float32, count*idx.dim)
 	normalizedVecs := make([][]float32, count)
 
@@ -219,16 +232,42 @@ func (idx *HNSWIndex[T]) AddBatch(ids []string, vecs []types.Vector, metas []map
 	var batchMaxLevel = -1
 	var batchEP = -1
 
+	switch vArena := any(vecArena).(type) {
+	case []float32:
+		for i := 0; i < count; i++ {
+			// Normalize
+			start := i * idx.dim
+			end := start + idx.dim
+			nv := flatBuf[start:end]
+			copy(nv, vecs[i])
+			maths.NormalizeInPlace(nv)
+			normalizedVecs[i] = nv
+
+			// Copy to Arena
+			dest := vArena[start:end]
+			copy(dest, nv) // Direct copy Float32 -> Float32
+		}
+	case []uint8:
+		for i := 0; i < count; i++ {
+			// Normalize
+			start := i * idx.dim
+			end := start + idx.dim
+			nv := flatBuf[start:end]
+			copy(nv, vecs[i])
+			maths.NormalizeInPlace(nv)
+			normalizedVecs[i] = nv
+
+			// Quantize into Arena
+			dest := vArena[start:end]
+			maths.QuantizeSQ8Into(nv, dest) // Direct Quantize Float32 -> Uint8
+		}
+	}
+
 	for i := 0; i < count; i++ {
 		start := i * idx.dim
 		end := start + idx.dim
-		nv := flatBuf[start:end]
 
-		copy(nv, vecs[i])
-		maths.NormalizeInPlace(nv)
-		normalizedVecs[i] = nv
-
-		storedVec := idx.convertFunc(nv)
+		storedVec := vecArena[start:end]
 
 		var vecSum uint32
 		if v, ok := any(storedVec).([]uint8); ok {
@@ -237,13 +276,21 @@ func (idx *HNSWIndex[T]) AddBatch(ids []string, vecs []types.Vector, metas []map
 
 		level := rngCtx.randomLevel()
 
-		node := &Node[T]{
-			ID:        ids[i],
-			Vec:       storedVec,
-			VecSum:    vecSum,
-			Level:     level,
-			Neighbors: make([][]int, level+1),
+		neighbors := make([][]int, level+1)
+		for l := 0; l <= level; l++ {
+			cap := idx.M
+			if l == 0 {
+				cap = idx.MMax0
+			}
+			neighbors[l] = make([]int, 0, cap)
 		}
+
+		node := &nodeArena[i]
+		node.ID = ids[i]
+		node.Vec = storedVec
+		node.VecSum = vecSum
+		node.Level = level
+		node.Neighbors = neighbors
 
 		// Update Global State
 		internalID := startIdx + i
@@ -286,7 +333,10 @@ func (idx *HNSWIndex[T]) AddBatch(ids []string, vecs []types.Vector, metas []map
 			workerCtx := idx.searchCtxPool.Get().(*searchCtx)
 			defer idx.searchCtxPool.Put(workerCtx)
 
-			idx.parallelLink(workerCtx, node, qVec)
+			distFunc := func(nodeIdx int) float32 {
+				return idx.distQueryFunc(qVec, idx.nodes[nodeIdx].Vec)
+			}
+			idx.parallelLink(workerCtx, node, distFunc)
 
 		}(i)
 	}
@@ -305,7 +355,7 @@ func (idx *HNSWIndex[T]) AddBatch(ids []string, vecs []types.Vector, metas []map
 }
 
 // parallelLink inserts a node into the graph using fine-grained locking
-func (idx *HNSWIndex[T]) parallelLink(ctx *searchCtx, node *Node[T], query []float32) {
+func (idx *HNSWIndex[T]) parallelLink(ctx *searchCtx, node *Node[T], distFunc func(int) float32) {
 	// We read enterPoint atomically (or just accept it might change slightly during batch)
 	// Since we are in the same batch, using the updated EP from Phase 1 is fine.
 	currObj := idx.enterPoint
@@ -315,7 +365,7 @@ func (idx *HNSWIndex[T]) parallelLink(ctx *searchCtx, node *Node[T], query []flo
 		return
 	}
 
-	currDist := idx.distQueryFunc(query, idx.nodes[currObj].Vec)
+	currDist := distFunc(currObj)
 
 	// 1. Greedy Search (Standard)
 	for l := idx.maxLevel; l > node.Level; l-- {
@@ -326,14 +376,14 @@ func (idx *HNSWIndex[T]) parallelLink(ctx *searchCtx, node *Node[T], query []flo
 			// FINE-GRAINED READ LOCK
 			// We must lock the current node to safely read its neighbors
 			currNode := idx.nodes[currObj]
-			currNode.mu.RLock()
+			ctx.scratchNeighbors = ctx.scratchNeighbors[:0]
 
-			neighbors := make([]int, len(currNode.Neighbors[l]))
-			copy(neighbors, currNode.Neighbors[l])
+			currNode.mu.RLock()
+			ctx.scratchNeighbors = append(ctx.scratchNeighbors, currNode.Neighbors[l]...)
 			currNode.mu.RUnlock()
 
-			for _, neighborID := range neighbors {
-				dist := idx.distQueryFunc(query, idx.nodes[neighborID].Vec)
+			for _, neighborID := range ctx.scratchNeighbors {
+				dist := distFunc(neighborID)
 				if dist > currDist {
 					currDist = dist
 					currObj = neighborID
@@ -346,7 +396,7 @@ func (idx *HNSWIndex[T]) parallelLink(ctx *searchCtx, node *Node[T], query []flo
 	// 2. Link at each level
 	for l := int(math.Min(float64(node.Level), float64(idx.maxLevel))); l >= 0; l-- {
 		// Search layer needs to be updated to use RLock internally
-		idx.searchLayerLocked(ctx, query, currObj, idx.EfConstruction, l)
+		idx.searchLayerLocked(ctx, distFunc, currObj, idx.EfConstruction, l)
 
 		neighbors := idx.selectNeighborsFromHeap(ctx, ctx.results, idx.M)
 
@@ -361,14 +411,11 @@ func (idx *HNSWIndex[T]) parallelLink(ctx *searchCtx, node *Node[T], query []flo
 
 		// Update currObj for next layer...
 		if ctx.results.Len() > 0 {
-			// Accessing backing slice directly if possible, or Peek.
-			// In MinHeap (results), the TOP is the FURTHEST (worst).
-			// We need the CLOSEST. The heap stores 'ef' best candidates.
-			// Any element in heap is good, but we want a good start point.
-			// Ideally we pick the closest one.
-			// Iterating the heap to find min dist is cheap (ef is small).
+			// Find BEST candidate (max score) for next layer
+			// MinHeap (results) stores top-K.
+			// We iterate to find the max score among them.
 			bestID := -1
-			bestDist := float32(-1)
+			bestDist := float32(-1) // Assuming normalized, score is [-1, 1]
 
 			for _, item := range *ctx.results {
 				if bestID == -1 || item.score > bestDist { // Score is similarity (higher better)
@@ -395,7 +442,7 @@ func (idx *HNSWIndex[T]) UpdateMetadata(id string, meta map[string]any) error {
 
 // searchLayerLocked performs BFS with priority queue (Beam Search) but locks nodes when reading neighbors
 // Returns list of candidates sorted by Score DESC (Closest first)
-func (idx *HNSWIndex[T]) searchLayerLocked(ctx *searchCtx, query types.Vector, entryPoint, ef, level int) {
+func (idx *HNSWIndex[T]) searchLayerLocked(ctx *searchCtx, distFunc func(int) float32, entryPoint, ef, level int) {
 	ctx.reset()
 
 	// 1. Manage Visited List (Thread-Local logic)
@@ -421,15 +468,15 @@ func (idx *HNSWIndex[T]) searchLayerLocked(ctx *searchCtx, query types.Vector, e
 	ctx.visitedList[entryPoint] = ctx.visitedToken
 
 	// 2. Initialize Heaps
-	dist := idx.distQueryFunc(query, idx.nodes[entryPoint].Vec)
+	dist := distFunc(entryPoint)
 	item := pqItem{id: entryPoint, score: dist}
-	heap.Push(ctx.candidates, item)
-	heap.Push(ctx.results, item)
+	ctx.candidates.Push(item)
+	ctx.results.Push(item)
 
 	// 3. Beam Search
 	for ctx.candidates.Len() > 0 {
-		curr := heap.Pop(ctx.candidates).(pqItem)
-		furthestResult := (*ctx.results)[0] // MinHeap Top is the WORST score
+		curr := ctx.candidates.Pop()        // Get best candidate
+		furthestResult := (*ctx.results)[0] // Get worst result (min score)
 
 		if curr.score < furthestResult.score && ctx.results.Len() >= ef {
 			break
@@ -437,36 +484,55 @@ func (idx *HNSWIndex[T]) searchLayerLocked(ctx *searchCtx, query types.Vector, e
 
 		// Lock node to read neighbors
 		node := idx.nodes[curr.id]
-		// Fast Copy Neighbors (Critical Section - Very Short)
-		// We copy the slice so we can release the lock immediately.
-		// node.Neighbors[level] usage inside lock is safe.
-		// Allocation here is cheap compared to holding lock during distance calc.
-		// To further optimize, we could reuse a buffer from ctx, but a small slice alloc is negligible.
+		ctx.scratchNeighbors = ctx.scratchNeighbors[:0]
+
 		node.mu.RLock()
-		neighbors := make([]int, len(node.Neighbors[level]))
-		copy(neighbors, node.Neighbors[level])
+		ctx.scratchNeighbors = append(ctx.scratchNeighbors, node.Neighbors[level]...)
 		node.mu.RUnlock()
 
 		// Iterate neighbors directly inside lock is okay if callback is fast
-		for _, neighborID := range neighbors {
+		for _, neighborID := range ctx.scratchNeighbors {
 			if ctx.visitedList[neighborID] != ctx.visitedToken {
 				ctx.visitedList[neighborID] = ctx.visitedToken
 
 				// Heavy math calculation happens here, fully parallel
 				// No other threads are blocked on 'node' while we do this
-				dist := idx.distQueryFunc(query, idx.nodes[neighborID].Vec)
+				dist := distFunc(neighborID)
 				newItem := pqItem{id: neighborID, score: dist}
 
 				if ctx.results.Len() < ef || dist > (*ctx.results)[0].score {
-					heap.Push(ctx.candidates, newItem)
-					heap.Push(ctx.results, newItem)
+					ctx.candidates.Push(newItem)
+					ctx.results.Push(newItem)
 					if ctx.results.Len() > ef {
-						heap.Pop(ctx.results)
+						ctx.results.Pop() // Remove worst
 					}
 				}
 			}
 		}
 	}
+}
+
+// selectNeighborsFromHeap for selecting neighbors from heap
+func (idx *HNSWIndex[T]) selectNeighborsFromHeap(ctx *searchCtx, h *minHeap, m int) []int {
+	count := h.Len()
+	ctx.neighborBuf = ctx.neighborBuf[:0]
+	if cap(ctx.neighborBuf) < count {
+		ctx.neighborBuf = make([]int, 0, count)
+	}
+
+	// We pop all items. MinHeap pops lowest score first.
+	// We want the BEST candidates.
+	// So if we pop 10 items, the LAST m items are the best.
+	for h.Len() > 0 {
+		ctx.neighborBuf = append(ctx.neighborBuf, h.Pop().id)
+	}
+
+	start := 0
+	if count > m {
+		start = count - m
+	}
+
+	return ctx.neighborBuf[start:]
 }
 
 // addConnectionLocked connects two nodes safely
@@ -495,10 +561,10 @@ func (idx *HNSWIndex[T]) addConnectionLocked(ctx *searchCtx, level, from, to int
 
 		for _, neighborID := range node.Neighbors[level] {
 			score := idx.distNodeFunc(fromNode, idx.nodes[neighborID])
-			heap.Push(h, pqItem{id: neighborID, score: score})
+			h.Push(pqItem{id: neighborID, score: score}) // Push to MinHeap
 
 			if h.Len() > maxM {
-				heap.Pop(h)
+				h.Pop() // Drop worst
 			}
 		}
 
@@ -523,23 +589,22 @@ func (idx *HNSWIndex[T]) Search(query types.Vector, k int, filter types.FilterFu
 
 	normalizedQuery := query
 
-	var q8 []uint8
-	var qSum uint32
-	useQuantizedSearch := false
-
+	var distFunc func(int) float32
 	if idx.distQuantizedFunc != nil {
-		q8 = maths.QuantizeSQ8(query)
-		qSum = maths.CalculateVecSum(q8)
-		useQuantizedSearch = true
-	}
+		// SQ8 Optimized Path: Use Integer SIMD
+		q8 := maths.QuantizeSQ8(query)
+		qSum := maths.CalculateVecSum(q8)
 
-	distFunc := func(nodeIdx int) float32 {
-		node := idx.nodes[nodeIdx]
-		if useQuantizedSearch {
+		distFunc = func(nodeIdx int) float32 {
+			node := idx.nodes[nodeIdx]
 			n := any(node.Vec).([]uint8)
 			return idx.distQuantizedFunc(q8, n, qSum, node.VecSum)
 		}
-		return idx.distQueryFunc(normalizedQuery, node.Vec)
+	} else {
+		// Float32 Path
+		distFunc = func(nodeIdx int) float32 {
+			return idx.distQueryFunc(normalizedQuery, idx.nodes[nodeIdx].Vec)
+		}
 	}
 
 	searchCtx := idx.searchCtxPool.Get().(*searchCtx)
@@ -577,7 +642,7 @@ func (idx *HNSWIndex[T]) Search(query types.Vector, k int, filter types.FilterFu
 		efSearch = k
 	}
 
-	idx.searchLayerLocked(searchCtx, normalizedQuery, currObj, efSearch, 0)
+	idx.searchLayerLocked(searchCtx, distFunc, currObj, efSearch, 0)
 
 	candidates := *searchCtx.results
 	slices.SortFunc(candidates, func(a, b pqItem) int {
@@ -705,10 +770,15 @@ func (idx *HNSWIndex[T]) Save(path string) error {
 			}
 		}
 
+		// Optimized Vector Write
 		switch v := any(node.Vec).(type) {
 		case []float32:
-			if err = binary.Write(w, binary.LittleEndian, v); err != nil {
-				return err
+			// Unsafe cast to bytes for speed
+			if len(v) > 0 {
+				bytes := unsafe.Slice((*byte)(unsafe.Pointer(&v[0])), len(v)*4)
+				if _, err = w.Write(bytes); err != nil {
+					return err
+				}
 			}
 		case []uint8:
 			if _, err = w.Write(v); err != nil {
@@ -863,14 +933,16 @@ func (idx *HNSWIndex[T]) Load(path string) error {
 				return err
 			}
 
-			layerInt32 := make([]int32, layerCount)
-			if err := binary.Read(r, binary.LittleEndian, &layerInt32); err != nil {
+			byteCount := int(layerCount) * 4
+			rawBytes := make([]byte, byteCount)
+			if _, err := io.ReadFull(r, rawBytes); err != nil {
 				return err
 			}
 
 			layer := make([]int, layerCount)
-			for k, v := range layerInt32 {
-				layer[k] = int(v)
+			for k := 0; k < int(layerCount); k++ {
+				val := binary.LittleEndian.Uint32(rawBytes[k*4 : (k+1)*4])
+				layer[k] = int(int32(val))
 			}
 			neighbors[l] = layer
 		}
@@ -878,7 +950,9 @@ func (idx *HNSWIndex[T]) Load(path string) error {
 		vec := make([]T, idx.dim)
 		switch v := any(vec).(type) {
 		case []float32:
-			if err := binary.Read(r, binary.LittleEndian, v); err != nil {
+			byteLen := idx.dim * 4
+			rawBytes := unsafe.Slice((*byte)(unsafe.Pointer(&v[0])), byteLen)
+			if _, err := io.ReadFull(r, rawBytes); err != nil {
 				return err
 			}
 		case []uint8:
@@ -932,5 +1006,45 @@ func (idx *HNSWIndex[T]) Load(path string) error {
 		}
 	}
 
+	return nil
+}
+
+// Count returns the number of indexed vectors
+func (idx *HNSWIndex[T]) Count() int {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return len(idx.idMap)
+}
+
+// Dim returns the dimension of indexed vectors
+func (idx *HNSWIndex[T]) Dim() int {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return idx.dim
+}
+
+// SetVersion sets the index version
+func (idx *HNSWIndex[T]) SetVersion(v uint64) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	idx.Version = v
+}
+
+// GetVersion returns the index version
+func (idx *HNSWIndex[T]) GetVersion() uint64 {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	return idx.Version
+}
+
+// DeletedCount returns the number of ghost nodes (marked in tombstones)
+func (idx *HNSWIndex[T]) DeletedCount() int {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return idx.tombstones.CountSetBits()
+}
+
+// Close cleans up resources
+func (idx *HNSWIndex[T]) Close() error {
 	return nil
 }
