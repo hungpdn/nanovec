@@ -9,6 +9,7 @@ import (
 	"os"
 	"runtime"
 	"slices"
+	"sort"
 	"sync"
 
 	"github.com/hungpdn/nanovec/pkg/bitset"
@@ -116,7 +117,7 @@ func (idx *HNSWIndex[T]) Add(id string, vec types.Vector, meta map[string]any) e
 	ctx := idx.searchCtxPool.Get().(*searchCtx)
 	defer idx.searchCtxPool.Put(ctx)
 
-	// --- PHASE 1: PRE-ALLOCATION (Global Lock) ---
+	// Phase 1: pre-allocation (global lock)
 	idx.mu.Lock()
 
 	// Check duplicates
@@ -158,7 +159,7 @@ func (idx *HNSWIndex[T]) Add(id string, vec types.Vector, meta map[string]any) e
 	// So that other threads (Search or AddBatch) can continue running
 	idx.mu.Unlock()
 
-	// --- PHASE 2: LINKING (Fine-Grained Lock) ---
+	// Phase 2: Parallel Linking (Fine-Grained)
 	idx.parallelLink(ctx, node, navQuery)
 
 	return nil
@@ -166,7 +167,7 @@ func (idx *HNSWIndex[T]) Add(id string, vec types.Vector, meta map[string]any) e
 
 // AddBatch adds multiple vectors
 func (idx *HNSWIndex[T]) AddBatch(ids []string, vecs []types.Vector, metas []map[string]any) error {
-	// --- PHASE 1: PRE-ALLOCATION (Global Lock) ---
+	// Phase 1: pre-allocation (global lock)
 	idx.mu.Lock()
 
 	for _, id := range ids {
@@ -184,11 +185,20 @@ func (idx *HNSWIndex[T]) AddBatch(ids []string, vecs []types.Vector, metas []map
 	rngCtx := idx.searchCtxPool.Get().(*searchCtx)
 
 	newNodes := make([]*Node[T], count)
+	flatBuf := make([]float32, count*idx.dim)
 	normalizedVecs := make([][]float32, count)
 
+	// Local variables for Batch Global State Update (Fix Race Condition)
+	var batchMaxLevel int = -1
+	var batchEP int = -1
+
 	for i := 0; i < count; i++ {
+		// Slice from the single backing array
+		start := i * idx.dim
+		end := start + idx.dim
+		nv := flatBuf[start:end]
+
 		// Normalize
-		nv := make([]float32, idx.dim)
 		copy(nv, vecs[i])
 		maths.NormalizeInPlace(nv)
 		normalizedVecs[i] = nv
@@ -211,26 +221,31 @@ func (idx *HNSWIndex[T]) AddBatch(ids []string, vecs []types.Vector, metas []map
 		idx.Metadata[ids[i]] = metas[i]
 		newNodes[i] = node
 
-		// Update maxLevel globally
-		if level > idx.maxLevel {
+		// Track max level change LOCALLY
+		if level > batchMaxLevel {
+			batchMaxLevel = level
+			batchEP = internalID
+		}
+
+		// Edge case: First node ever -> Set EP immediately
+		if idx.enterPoint == -1 {
+			idx.enterPoint = internalID
 			idx.maxLevel = level
-			idx.enterPoint = internalID // Simplification: New highest node becomes EP
 		}
 	}
 
 	idx.searchCtxPool.Put(rngCtx)
 
 	// Release Global Lock immediately
-	// Now other readers can access existing nodes, and we can link new nodes in parallel
 	idx.mu.Unlock()
 
-	// --- PHASE 2: PARALLEL LINKING (Fine-Grained) ---
+	// Phase 2: Parallel Linking (Fine-Grained)
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, runtime.GOMAXPROCS(0))
 
 	for i := 0; i < count; i++ {
 		wg.Add(1)
-		sem <- struct{}{}
+		sem <- struct{}{} // Block here if full
 
 		go func(i int) {
 			defer wg.Done()
@@ -248,6 +263,14 @@ func (idx *HNSWIndex[T]) AddBatch(ids []string, vecs []types.Vector, metas []map
 	}
 	wg.Wait()
 
+	// Phase 3: Finalize Global State
+	// Update EP only after connections are established to avoid "Island Nodes"
+	idx.mu.Lock()
+	if batchMaxLevel > idx.maxLevel {
+		idx.maxLevel = batchMaxLevel
+		idx.enterPoint = batchEP
+	}
+	idx.mu.Unlock()
 	return nil
 }
 
@@ -507,14 +530,13 @@ func (idx *HNSWIndex[T]) Search(query types.Vector, k int, filter types.FilterFu
 
 	idx.searchLayerLocked(searchCtx, normalizedQuery, currObj, efSearch, 0)
 
-	// Heap contents are not sorted, need to pop them
-	finalCandidates := make([]pqItem, searchCtx.results.Len())
-	for i := searchCtx.results.Len() - 1; i >= 0; i-- {
-		finalCandidates[i] = heap.Pop(searchCtx.results).(pqItem)
-	}
+	candidates := *searchCtx.results
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].score > candidates[j].score
+	})
 
 	results := make([]types.SearchResult, 0, k)
-	for _, c := range finalCandidates {
+	for _, c := range candidates {
 
 		if idx.tombstones.IsSet(c.id) {
 			continue
