@@ -76,6 +76,7 @@ func (idx *FlatIndexSQ8) AddBatch(ids []string, vecs []types.Vector, metas []map
 	}
 
 	idx.RawVectors = slices.Grow(idx.RawVectors, needed)
+	idx.IDs = slices.Grow(idx.IDs, len(ids))
 
 	normBuf := make(types.Vector, idx.dim)
 	for i, id := range ids {
@@ -84,8 +85,19 @@ func (idx *FlatIndexSQ8) AddBatch(ids []string, vecs []types.Vector, metas []map
 		copy(normBuf, vecs[i])
 		maths.NormalizeInPlace(normBuf)
 
-		qVec := maths.QuantizeSQ8(normBuf)
-		idx.RawVectors = append(idx.RawVectors, qVec...)
+		// OPTIMIZATION: Inline Quantization
+		// Write directly to RawVectors (which was already grown via slices.Grow)
+		// This avoids allocating the intermediate 'qVec' slice for every vector.
+		for _, v := range normBuf {
+			val := (v + 1.0) * 127.5
+			if val < 0 {
+				val = 0
+			}
+			if val > 255 {
+				val = 255
+			}
+			idx.RawVectors = append(idx.RawVectors, uint8(val))
+		}
 
 		idx.AddMeta(id, meta)
 	}
@@ -122,8 +134,7 @@ func (idx *FlatIndexSQ8) Search(query types.Vector, k int, filter types.FilterFu
 		start := i * idx.dim
 		end := start + idx.dim
 		qVec := idx.RawVectors[start:end]
-		dequantBuf := maths.DequantizeSQ8(qVec) // Reusable buffer for dequantization to avoid allocs in loop
-		score := maths.DotProduct(normalizedQuery, dequantBuf)
+		score := maths.DotProductSQ8(normalizedQuery, qVec)
 
 		if h.Len() < k {
 			heap.Push(h, Item{ID: id, Score: score})
@@ -204,6 +215,7 @@ func (idx *FlatIndexSQ8) Save(path string) error {
 	return os.Rename(tmpPath, path)
 }
 
+// Load
 func (idx *FlatIndexSQ8) Load(path string) error {
 	idx.Lock()
 	defer idx.Unlock()
@@ -221,11 +233,7 @@ func (idx *FlatIndexSQ8) Load(path string) error {
 	idx.dim = int(header[0])
 
 	dec := gob.NewDecoder(f)
-	if err := dec.Decode(&idx.IDs); err != nil {
-		return err
-	}
 
-	idx.Metadata = make(map[string]map[string]any)
 	if err := idx.LoadBase(dec); err != nil {
 		return err
 	}

@@ -23,5 +23,6 @@ type Storage interface {
 	Delete(id string) error
 	Scan(fn func(doc *types.Document) error) error
 	Has(id string) bool
+	Count() (int, error)
 	Close() error
 }

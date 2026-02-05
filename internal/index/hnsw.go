@@ -266,7 +266,9 @@ func (idx *HNSWIndex) Search(query types.Vector, k int, filter types.FilterFunc)
 		id := idx.nodes[c.id].id
 
 		// Check for ghost nodes (Soft Deleted)
-		if _, exists := idx.idMap[id]; !exists {
+		// This filters out both "Deleted" items and "Stale" items (from updates)
+		currentInternalID, exists := idx.idMap[id]
+		if !exists || currentInternalID != c.id {
 			continue
 		}
 
@@ -452,6 +454,7 @@ func (idx *HNSWIndex) Save(path string) error {
 	return os.Rename(tmpPath, path)
 }
 
+// Load
 func (idx *HNSWIndex) Load(path string) error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
@@ -499,6 +502,14 @@ func (idx *HNSWIndex) Load(path string) error {
 	idx.Metadata = make(map[string]map[string]any)
 	if err := dec.Decode(&idx.Metadata); err != nil {
 		return err
+	}
+
+	// Prune Ghost Nodes
+	// If an ID is in nodes/idMap but NOT in Metadata, it was soft-deleted.
+	for id := range idx.idMap {
+		if _, isLive := idx.Metadata[id]; !isLive {
+			delete(idx.idMap, id)
+		}
 	}
 
 	return nil

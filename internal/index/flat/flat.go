@@ -72,6 +72,7 @@ func (idx *FlatIndex) AddBatch(ids []string, vecs []types.Vector, metas []map[st
 	}
 
 	idx.RawVectors = slices.Grow(idx.RawVectors, needed)
+	idx.IDs = slices.Grow(idx.IDs, len(ids))
 
 	for i, id := range ids {
 		vec := vecs[i]

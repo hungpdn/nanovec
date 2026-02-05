@@ -60,3 +60,39 @@ func DotProduct(a, b []float32) float32 {
 
 	return sum
 }
+
+// DotProductSQ8 calculates dot product directly from a quantized vector.
+// It combines Dequantization + DotProduct in a single pass (Fusing).
+func DotProductSQ8(query []float32, qVec []uint8) float32 {
+	if len(query) != len(qVec) || len(query) == 0 {
+		return 0
+	}
+
+	// Bounds Check Elimination
+	_ = query[len(query)-1]
+	_ = qVec[len(qVec)-1]
+
+	var sum float32
+	i := 0
+
+	// Unrolled Loop (4x)
+	for ; i <= len(query)-4; i += 4 {
+		v0 := (float32(qVec[i]) * InvScale) - 1.0
+		v1 := (float32(qVec[i+1]) * InvScale) - 1.0
+		v2 := (float32(qVec[i+2]) * InvScale) - 1.0
+		v3 := (float32(qVec[i+3]) * InvScale) - 1.0
+
+		sum += query[i]*v0 +
+			query[i+1]*v1 +
+			query[i+2]*v2 +
+			query[i+3]*v3
+	}
+
+	// Handle remaining
+	for ; i < len(query); i++ {
+		val := (float32(qVec[i]) * InvScale) - 1.0
+		sum += query[i] * val
+	}
+
+	return sum
+}

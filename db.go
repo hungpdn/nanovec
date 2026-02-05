@@ -35,6 +35,7 @@ func Open(path string, cfg *Config) (*DB, error) {
 	indexPath := path + ".idx"
 	err = idx.Load(indexPath)
 	if err != nil {
+		// If load fails, we will rebuild, so just init a fresh index
 		idx = cfg.GetVectorIndex()
 	}
 	indexLoaded := err == nil
@@ -50,9 +51,28 @@ func Open(path string, cfg *Config) (*DB, error) {
 		storage: store,
 	}
 
-	// Self-Healing: Rebuild index if missing or empty
-	if !indexLoaded || idx.Count() == 0 {
-		fmt.Println("⚠️ Index missing or empty. Rebuilding from Storage...")
+	storeCount, err := db.storage.Count()
+	if err != nil {
+		return nil, fmt.Errorf("failed to check storage integrity: %v", err)
+	}
+
+	// Self-Healing: rebuild if
+	// - Index failed to load
+	// - Counts mismatch (Sync Drift / Corruption)
+	if !indexLoaded || idx.Count() != storeCount {
+		reason := "Index missing or corrupt"
+		if indexLoaded && idx.Count() != storeCount {
+			reason = fmt.Sprintf("Sync drift detected (Index: %d, Store: %d)", idx.Count(), storeCount)
+		}
+
+		fmt.Printf("⚠️ %s. Rebuilding from Storage...\n", reason)
+
+		// Reset Index to clean state before rebuilding
+		// (Important if we had a partial/stale index loaded)
+		if idx.Count() > 0 {
+			// Since we don't have a Clear() method, we just re-init
+			db.index = cfg.GetVectorIndex()
+		}
 
 		const batchSize = 1000
 		var batchIDs []string

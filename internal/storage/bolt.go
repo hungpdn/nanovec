@@ -123,6 +123,21 @@ func (s *BoltStorage) Has(id string) bool {
 	return found
 }
 
+// Count returns the total number of items in the bucket
+func (s *BoltStorage) Count() (int, error) {
+	var count int
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		b := tx.Bucket([]byte(bucketName))
+		if b == nil {
+			return nil
+		}
+		// KeyN is efficient (reads metadata) and doesn't scan the whole tree
+		count = b.Stats().KeyN
+		return nil
+	})
+	return count, err
+}
+
 // Close closes the database connection
 func (s *BoltStorage) Close() error {
 	return s.db.Close()
