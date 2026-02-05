@@ -5,7 +5,6 @@ import (
 	"encoding/gob"
 	"fmt"
 	"math"
-	"math/rand"
 	"os"
 	"sync"
 
@@ -34,9 +33,8 @@ type HNSWIndex[T types.Number] struct {
 	Metadata map[string]map[string]any
 	Version  uint64
 
-	// visitedList stores the "visit token" for each node internal ID.
-	visitedList  []uint32
-	visitedToken uint32 // Current search generation
+	// Concurrency: Pool of search contexts
+	searchCtxPool *sync.Pool
 
 	// Injected behavior
 	// convertFunc converts input float32 vector to storage type T
@@ -53,6 +51,34 @@ type Node[T types.Number] struct {
 	Vec       []T
 	Level     int
 	Neighbors [][]int // [level][neighbor_internal_index]
+}
+
+func newHNSWIndex[T types.Number](dim, m, efConstruction int,
+	conv func([]float32) []T,
+	distQ func([]float32, []T) float32,
+	distN func([]T, []T) float32) *HNSWIndex[T] {
+
+	idx := &HNSWIndex[T]{
+		dim:            dim,
+		M:              m,
+		MMax0:          m * 2,
+		EfConstruction: efConstruction,
+		LevelMult:      1.0 / math.Log(float64(m)),
+		nodes:          make([]*Node[T], 0),
+		idMap:          make(map[string]int),
+		Metadata:       make(map[string]map[string]any),
+		enterPoint:     -1,
+		maxLevel:       -1,
+		convertFunc:    conv,
+		distQueryFunc:  distQ,
+		distNodeFunc:   distN,
+		searchCtxPool: &sync.Pool{
+			New: func() any {
+				return newSearchCtx()
+			},
+		},
+	}
+	return idx
 }
 
 // NewHNSWIndexFloat creates a standard Float32 HNSW index
@@ -77,30 +103,6 @@ func NewHNSWIndexSQ8(dim, m, efConstruction int) *HNSWIndex[uint8] {
 		maths.DotProductSQ8,
 		maths.DotProductUint8,
 	)
-}
-
-// Helper to construct index
-func newHNSWIndex[T types.Number](dim, m, efConstruction int,
-	conv func([]float32) []T,
-	distQ func([]float32, []T) float32,
-	distN func([]T, []T) float32) *HNSWIndex[T] {
-
-	idx := &HNSWIndex[T]{
-		dim:            dim,
-		M:              m,
-		MMax0:          m * 2,
-		EfConstruction: efConstruction,
-		LevelMult:      1.0 / math.Log(float64(m)),
-		nodes:          make([]*Node[T], 0),
-		idMap:          make(map[string]int),
-		Metadata:       make(map[string]map[string]any),
-		enterPoint:     -1,
-		maxLevel:       -1,
-		convertFunc:    conv,
-		distQueryFunc:  distQ,
-		distNodeFunc:   distN,
-	}
-	return idx
 }
 
 // Add inserts a vector into the HNSW graph
@@ -141,6 +143,9 @@ func (idx *HNSWIndex[T]) internalAdd(id string, vec types.Vector, meta map[strin
 		return errors.ErrDimMismatch
 	}
 
+	searchCtx := idx.searchCtxPool.Get().(*searchCtx)
+	defer idx.searchCtxPool.Put(searchCtx)
+
 	var navQuery []float32
 	if scratch != nil {
 		navQuery = scratch
@@ -153,7 +158,7 @@ func (idx *HNSWIndex[T]) internalAdd(id string, vec types.Vector, meta map[strin
 
 	storedVec := idx.convertFunc(vec)
 
-	level := randomLevel()
+	level := searchCtx.randomLevel()
 	internalID := len(idx.nodes)
 
 	node := &Node[T]{
@@ -192,14 +197,35 @@ func (idx *HNSWIndex[T]) internalAdd(id string, vec types.Vector, meta map[strin
 	}
 
 	for l := int(math.Min(float64(level), float64(idx.maxLevel))); l >= 0; l-- {
-		candidates := idx.searchLayer(navQuery, currObj, idx.EfConstruction, l)
-		neighbors := idx.selectNeighbors(candidates, idx.M)
+		idx.searchLayer(searchCtx, navQuery, currObj, idx.EfConstruction, l)
+		// candidates are in ctx.results (MinHeap, furthest at top?? No, see searchLayer)
+		// searchLayer returns nothing, it populates ctx.results.
+		// Let's adjust searchLayer to return slice or use heap directly.
+		// For efficiency, let's look at modified searchLayer below.
+		neighbors := idx.selectNeighborsFromHeap(searchCtx, searchCtx.results, idx.M)
+
 		for _, neighborID := range neighbors {
 			idx.addConnection(l, internalID, neighborID)
 			idx.addConnection(l, neighborID, internalID)
 		}
-		if len(candidates) > 0 {
-			currObj = candidates[0].id
+		// Update currObj to the closest found for next layer
+		if searchCtx.results.Len() > 0 {
+			// Accessing backing slice directly if possible, or Peek.
+			// In MinHeap (results), the TOP is the FURTHEST (worst).
+			// We need the CLOSEST. The heap stores 'ef' best candidates.
+			// Any element in heap is good, but we want a good start point.
+			// Ideally we pick the closest one.
+			// Iterating the heap to find min dist is cheap (ef is small).
+			bestID := -1
+			bestDist := float32(-1)
+
+			for _, item := range *searchCtx.results {
+				if bestID == -1 || item.score > bestDist { // Score is similarity (higher better)
+					bestDist = item.score
+					bestID = item.id
+				}
+			}
+			currObj = bestID
 		}
 	}
 
@@ -212,65 +238,67 @@ func (idx *HNSWIndex[T]) internalAdd(id string, vec types.Vector, meta map[strin
 
 // searchLayer performs BFS with priority queue (Beam Search)
 // Returns list of candidates sorted by Score DESC (Closest first)
-func (idx *HNSWIndex[T]) searchLayer(query types.Vector, entryPoint, ef, level int) []pqItem {
+func (idx *HNSWIndex[T]) searchLayer(ctx *searchCtx, query types.Vector, entryPoint, ef, level int) {
+	ctx.reset() // Clear heaps
 
-	idx.visitedToken++
-	if idx.visitedToken == 0 {
-		idx.visitedToken = 1
-		for i := range idx.visitedList {
-			idx.visitedList[i] = 0
+	// 1. Manage Visited List (Thread-Local logic)
+	ctx.visitedToken++
+	if ctx.visitedToken == 0 {
+		ctx.visitedToken = 1
+		for i := range ctx.visitedList {
+			ctx.visitedList[i] = 0
 		}
 	}
+	// If nodes count grew larger than current visitedList capacity
+	currentNodes := len(idx.nodes)
+	if len(ctx.visitedList) < currentNodes {
+		// Grow by at least 10% or 1024 elements to amortize allocation cost
+		grow := currentNodes / 10
+		if grow < 1024 {
+			grow = 1024
+		}
+		newCap := currentNodes + grow
 
-	if len(idx.visitedList) < len(idx.nodes) {
-		newVis := make([]uint32, len(idx.nodes))
-		copy(newVis, idx.visitedList)
-		idx.visitedList = newVis
+		// Create new slice (zero-initialized).
+		// NO COPY NEEDED: The logic relies on 'visitedToken'.
+		// Since new slice is all 0s, and current token > 0, checks will correctly return "not visited".
+		ctx.visitedList = make([]uint32, newCap)
 	}
 
-	idx.visitedList[entryPoint] = idx.visitedToken
+	ctx.visitedList[entryPoint] = ctx.visitedToken
 
-	candidates := &MaxHeap{}
-	heap.Init(candidates)
-	results := &MinHeap{}
-	heap.Init(results)
-
+	// 2. Initialize Heaps
 	dist := idx.distQueryFunc(query, idx.nodes[entryPoint].Vec)
 	item := pqItem{id: entryPoint, score: dist}
 
-	heap.Push(candidates, item)
-	heap.Push(results, item)
+	heap.Push(ctx.candidates, item)
+	heap.Push(ctx.results, item)
 
-	for candidates.Len() > 0 {
-		curr := heap.Pop(candidates).(pqItem)
-		furthestResult := (*results)[0]
+	// 3. Beam Search
+	for ctx.candidates.Len() > 0 {
+		curr := heap.Pop(ctx.candidates).(pqItem)
+		furthestResult := (*ctx.results)[0] // MinHeap Top is the WORST score
 
-		if curr.score < furthestResult.score && results.Len() >= ef {
+		if curr.score < furthestResult.score && ctx.results.Len() >= ef {
 			break
 		}
 
 		for _, neighborID := range idx.nodes[curr.id].Neighbors[level] {
-			if idx.visitedList[neighborID] != idx.visitedToken {
-				idx.visitedList[neighborID] = idx.visitedToken
+			if ctx.visitedList[neighborID] != ctx.visitedToken {
+				ctx.visitedList[neighborID] = ctx.visitedToken
 				dist := idx.distQueryFunc(query, idx.nodes[neighborID].Vec)
 				newItem := pqItem{id: neighborID, score: dist}
 
-				if results.Len() < ef || dist > (*results)[0].score {
-					heap.Push(candidates, newItem)
-					heap.Push(results, newItem)
-					if results.Len() > ef {
-						heap.Pop(results)
+				if ctx.results.Len() < ef || dist > (*ctx.results)[0].score {
+					heap.Push(ctx.candidates, newItem)
+					heap.Push(ctx.results, newItem)
+					if ctx.results.Len() > ef {
+						heap.Pop(ctx.results)
 					}
 				}
 			}
 		}
 	}
-
-	finalRes := make([]pqItem, results.Len())
-	for i := results.Len() - 1; i >= 0; i-- {
-		finalRes[i] = heap.Pop(results).(pqItem)
-	}
-	return finalRes
 }
 
 // addConnection connects two nodes at a specific level, pruning if necessary
@@ -322,6 +350,9 @@ func (idx *HNSWIndex[T]) Search(query types.Vector, k int, filter types.FilterFu
 
 	normalizedQuery := query
 
+	searchCtx := idx.searchCtxPool.Get().(*searchCtx)
+	defer idx.searchCtxPool.Put(searchCtx)
+
 	currObj := idx.enterPoint
 	currDist := idx.distQueryFunc(normalizedQuery, idx.nodes[currObj].Vec)
 
@@ -345,10 +376,16 @@ func (idx *HNSWIndex[T]) Search(query types.Vector, k int, filter types.FilterFu
 		efSearch = k
 	}
 
-	candidates := idx.searchLayer(normalizedQuery, currObj, efSearch, 0)
+	idx.searchLayer(searchCtx, normalizedQuery, currObj, efSearch, 0)
+
+	// Heap contents are not sorted, need to pop them
+	finalCandidates := make([]pqItem, searchCtx.results.Len())
+	for i := searchCtx.results.Len() - 1; i >= 0; i-- {
+		finalCandidates[i] = heap.Pop(searchCtx.results).(pqItem)
+	}
 
 	results := make([]types.SearchResult, 0, k)
-	for _, c := range candidates {
+	for _, c := range finalCandidates {
 		id := idx.nodes[c.id].ID
 
 		currentInternalID, exists := idx.idMap[id]
@@ -516,65 +553,4 @@ func (idx *HNSWIndex[T]) Load(path string) error {
 		}
 	}
 	return nil
-}
-
-// --- Common Heaps/Utils ---
-
-type pqItem struct {
-	id    int
-	score float32
-}
-
-// MinHeap: Keeps the LOWEST score at top
-type MinHeap []pqItem
-
-func (h MinHeap) Len() int           { return len(h) }
-func (h MinHeap) Less(i, j int) bool { return h[i].score < h[j].score }
-func (h MinHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *MinHeap) Push(x any)        { *h = append(*h, x.(pqItem)) }
-func (h *MinHeap) Pop() any {
-	old := *h
-	n := len(old)
-	x := old[n-1]
-	*h = old[0 : n-1]
-	return x
-}
-
-// MaxHeap: Keeps the HIGHEST score at top
-type MaxHeap []pqItem
-
-func (h MaxHeap) Len() int           { return len(h) }
-func (h MaxHeap) Less(i, j int) bool { return h[i].score > h[j].score }
-func (h MaxHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *MaxHeap) Push(x any)        { *h = append(*h, x.(pqItem)) }
-func (h *MaxHeap) Pop() any {
-	old := *h
-	n := len(old)
-	x := old[n-1]
-	*h = old[0 : n-1]
-	return x
-}
-
-// --- Common Logic Functions ---
-
-// randomLevel generates a level for a new node
-func randomLevel() int {
-	lvl := 0
-	for rand.Float64() < 0.5 && lvl < 10 { // Cap level to avoid runaway
-		lvl++
-	}
-	return lvl
-}
-
-// selectNeighbors picks the M best candidates to connect
-func (idx *HNSWIndex[T]) selectNeighbors(candidates []pqItem, m int) []int {
-	count := len(candidates)
-	if count > m {
-		count = m
-	}
-	out := make([]int, count)
-	for i := 0; i < count; i++ {
-		out[i] = candidates[i].id
-	}
-	return out
 }
