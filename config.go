@@ -34,14 +34,24 @@ var DefaultConfig = Config{
 	EfConstruction: 200,
 }
 
+// GetVectorIndex creates the appropriate index based on configuration
+// It acts as a Factory for Flat/HNSW and Float32/SQ8 variants
 func (cfg *Config) GetVectorIndex() internal.VectorIndex {
-	if cfg.IndexType == IndexTypeHNSW {
-		// Future: Support HNSW + SQ8
+	switch cfg.IndexType {
+	case IndexTypeHNSW:
+		if cfg.Quantization {
+			// HNSW + SQ8 (Graph + Compression)
+			return index.NewHNSWIndexSQ8(cfg.Dimension, cfg.M, cfg.EfConstruction)
+		}
+		// HNSW + Float32 (Graph + Precision)
 		return index.NewHNSWIndex(cfg.Dimension, cfg.M, cfg.EfConstruction)
+
+	default: // Default to Flat
+		if cfg.Quantization {
+			// Flat + SQ8 (Scan + Compression)
+			return flat.NewFlatIndexSQ8(cfg.Dimension)
+		}
+		// Flat + Float32 (Scan + Precision)
+		return flat.NewFlatIndex(cfg.Dimension)
 	}
-	// Flat Index Selection
-	if cfg.Quantization {
-		return flat.NewFlatIndexSQ8(cfg.Dimension)
-	}
-	return flat.NewFlatIndex(cfg.Dimension)
 }

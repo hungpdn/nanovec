@@ -61,8 +61,8 @@ func DotProduct(a, b []float32) float32 {
 	return sum
 }
 
-// DotProductSQ8 calculates dot product directly from a quantized vector.
-// It combines Dequantization + DotProduct in a single pass (Fusing).
+// DotProductSQ8 calculates dot product between Query(Float32) and Node(Uint8).
+// Used during Search.
 func DotProductSQ8(query []float32, qVec []uint8) float32 {
 	if len(query) != len(qVec) || len(query) == 0 {
 		return 0
@@ -92,6 +92,44 @@ func DotProductSQ8(query []float32, qVec []uint8) float32 {
 	for ; i < len(query); i++ {
 		val := (float32(qVec[i]) * InvScale) - 1.0
 		sum += query[i] * val
+	}
+
+	return sum
+}
+
+// DotProductUint8 calculates dot product between Node(Uint8) and Node(Uint8).
+// Used during HNSW Graph Construction (adding connections).
+func DotProductUint8(a, b []uint8) float32 {
+	if len(a) != len(b) || len(a) == 0 {
+		return 0
+	}
+
+	_ = a[len(a)-1]
+	_ = b[len(a)-1]
+
+	var sum float32
+	i := 0
+
+	for ; i <= len(a)-4; i += 4 {
+		vA0 := (float32(a[i]) * InvScale) - 1.0
+		vB0 := (float32(b[i]) * InvScale) - 1.0
+
+		vA1 := (float32(a[i+1]) * InvScale) - 1.0
+		vB1 := (float32(b[i+1]) * InvScale) - 1.0
+
+		vA2 := (float32(a[i+2]) * InvScale) - 1.0
+		vB2 := (float32(b[i+2]) * InvScale) - 1.0
+
+		vA3 := (float32(a[i+3]) * InvScale) - 1.0
+		vB3 := (float32(b[i+3]) * InvScale) - 1.0
+
+		sum += vA0*vB0 + vA1*vB1 + vA2*vB2 + vA3*vB3
+	}
+
+	for ; i < len(a); i++ {
+		vA := (float32(a[i]) * InvScale) - 1.0
+		vB := (float32(b[i]) * InvScale) - 1.0
+		sum += vA * vB
 	}
 
 	return sum

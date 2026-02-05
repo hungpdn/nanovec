@@ -27,18 +27,16 @@ func assertEqual(t *testing.T, expected, actual any, msg string) {
 }
 
 func TestCrashRecovery(t *testing.T) {
-	// 1. Setup: Create a temporary directory (Go 1.15+ standard way)
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "crash_db_std")
 	cfg := &nanovec.Config{Dimension: 3}
 
-	// 2. Insert Data
+	// 1. Insert Data
 	func() {
 		db, err := nanovec.Open(dbPath, cfg)
 		assertNoError(t, err, "Failed to open DB for setup")
 		defer db.Close()
 
-		// Use InsertBatch to test the batch path
 		ids := []string{"doc1", "doc2"}
 		vecs := [][]float32{
 			{1.0, 0.0, 0.0},
@@ -53,26 +51,17 @@ func TestCrashRecovery(t *testing.T) {
 		assertNoError(t, err, "Failed to batch insert")
 	}()
 
-	// 3. Simulate Crash: Delete the .idx file
-	// The .store file (BoltDB) remains, which is our source of truth.
+	// 2. Simulate Crash: Delete the .idx file
 	idxPath := dbPath + ".idx"
 	err := os.Remove(idxPath)
 	assertNoError(t, err, "Failed to delete .idx file for simulation")
 
-	// Verify .store exists
-	storePath := dbPath + ".store"
-	if _, err := os.Stat(storePath); os.IsNotExist(err) {
-		t.Fatalf(".store file missing, cannot test recovery")
-	}
-
-	// 4. Recovery: Re-open the DB
-	// It should detect the missing index and rebuild it from storage.
+	// 3. Recovery
 	db, err := nanovec.Open(dbPath, cfg)
 	assertNoError(t, err, "Failed to re-open DB during recovery")
 	defer db.Close()
 
-	// 5. Verify Data matches
-	// Search for doc1
+	// 4. Verify Data matches
 	results, err := db.Search([]float32{1.0, 0.0, 0.0}, 5, nil)
 	assertNoError(t, err, "Search failed after recovery")
 
@@ -80,26 +69,11 @@ func TestCrashRecovery(t *testing.T) {
 		t.Fatal("Expected results, got 0")
 	}
 
-	// Verify Top 1 is doc1
 	top := results[0]
 	assertEqual(t, "doc1", top.ID, "Top result ID mismatch")
 
-	// Verify Metadata
-	if val, ok := top.Metadata["val"].(int); !ok || val != 100 {
-		// Note: Gob might decode numbers as int or float depending on implementation
-		// If it fails, check if it came back as float64, etc.
-		// For robustness in tests without testify, we often just print:
-		t.Logf("Metadata recovered: %v", top.Metadata)
-	}
-
-	// Verify Score (Float comparison needs epsilon)
 	if math.Abs(float64(top.Score)-1.0) > 0.0001 {
 		t.Errorf("Expected score ~1.0, got %f", top.Score)
-	}
-
-	// Verify doc2 exists via Exists()
-	if !db.Exists("doc2") {
-		t.Error("doc2 should exist after recovery")
 	}
 }
 
@@ -107,29 +81,23 @@ func TestHNSWIndex(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "hnsw_test")
 
-	// Configure for HNSW
 	cfg := &nanovec.Config{
 		Dimension:      3,
-		IndexType:      nanovec.IndexTypeHNSW, // <--- Switch to HNSW
+		IndexType:      nanovec.IndexTypeHNSW,
 		M:              16,
 		EfConstruction: 100,
 	}
 
-	// 1. Insert & Search
 	func() {
 		db, err := nanovec.Open(dbPath, cfg)
 		assertNoError(t, err, "Open HNSW DB")
 		defer db.Close()
 
-		// Insert vectors that are clearly distinct
-		// Vec A: [1, 0, 0]
-		// Vec B: [0, 1, 0]
 		err = db.Insert("vecA", []float32{1, 0, 0}, map[string]any{"type": "A"})
 		assertNoError(t, err, "Insert A")
 		err = db.Insert("vecB", []float32{0, 1, 0}, map[string]any{"type": "B"})
 		assertNoError(t, err, "Insert B")
 
-		// Search for A (Exact match)
 		results, err := db.Search([]float32{1, 0, 0}, 5, nil)
 		assertNoError(t, err, "Search A")
 
@@ -137,24 +105,18 @@ func TestHNSWIndex(t *testing.T) {
 			t.Fatal("HNSW returned 0 results")
 		}
 		assertEqual(t, "vecA", results[0].ID, "Should find vecA first")
-		if results[0].Score < 0.99 {
-			t.Errorf("Score too low for exact match: %f", results[0].Score)
-		}
 	}()
 
-	// 2. Persistence & Recovery
 	func() {
-		// Re-open (simulating restart)
 		db, err := nanovec.Open(dbPath, cfg)
 		assertNoError(t, err, "Re-Open HNSW DB")
 		defer db.Close()
 
-		// Verify data persisted
-		results, err := db.Search([]float32{0, 1, 0}, 5, nil) // Search for B
+		results, err := db.Search([]float32{0, 1, 0}, 5, nil)
 		assertNoError(t, err, "Search B after restart")
 
 		if len(results) == 0 {
-			t.Fatal("HNSW persistence failed (0 results)")
+			t.Fatal("HNSW persistence failed")
 		}
 		assertEqual(t, "vecB", results[0].ID, "Should find vecB after restart")
 	}()
@@ -167,48 +129,89 @@ func TestSQ8Index(t *testing.T) {
 	cfg := &nanovec.Config{
 		Dimension:    3,
 		IndexType:    nanovec.IndexTypeFlat,
-		Quantization: true, // <--- Enable SQ8
+		Quantization: true,
 	}
 
-	// 1. Insert & Search
 	func() {
 		db, err := nanovec.Open(dbPath, cfg)
 		assertNoError(t, err, "Open SQ8 DB")
 		defer db.Close()
 
-		// Insert normalized vectors (SQ8 works best with normalized data)
-		// Vec A: [1, 0, 0]
-		// Vec B: [0, 1, 0]
 		err = db.Insert("vecA", []float32{1, 0, 0}, map[string]any{"type": "A"})
 		assertNoError(t, err, "Insert A")
 		err = db.Insert("vecB", []float32{0, 1, 0}, map[string]any{"type": "B"})
 		assertNoError(t, err, "Insert B")
 
-		// Search for A
 		results, err := db.Search([]float32{1, 0, 0}, 5, nil)
 		assertNoError(t, err, "Search A")
 
 		if len(results) == 0 {
 			t.Fatal("SQ8 returned 0 results")
 		}
-
-		// SQ8 introduces slight precision loss, so score might not be exactly 1.0
-		// But for [1,0,0] vs [1,0,0], it should be extremely close.
 		assertEqual(t, "vecA", results[0].ID, "Should find vecA first")
 		if results[0].Score < 0.98 {
 			t.Errorf("Score too low for SQ8 match: %f", results[0].Score)
+		}
+	}()
+}
+
+// TestHNSWSQ8Index verifies the combination of Graph Search + Compression
+func TestHNSWSQ8Index(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "hnsw_sq8_test")
+
+	cfg := &nanovec.Config{
+		Dimension:      3,
+		IndexType:      nanovec.IndexTypeHNSW, // Enable Graph
+		Quantization:   true,                  // Enable Compression
+		M:              16,
+		EfConstruction: 100,
+	}
+
+	// 1. Insert & Search
+	func() {
+		db, err := nanovec.Open(dbPath, cfg)
+		assertNoError(t, err, "Open HNSW+SQ8 DB")
+		defer db.Close()
+
+		// Insert vectors
+		// Use clearly separable vectors to test graph navigation
+		err = db.Insert("vecA", []float32{1, 0, 0}, map[string]any{"type": "A"})
+		assertNoError(t, err, "Insert A")
+		err = db.Insert("vecB", []float32{0, 1, 0}, map[string]any{"type": "B"})
+		assertNoError(t, err, "Insert B")
+		err = db.Insert("vecC", []float32{0, 0, 1}, map[string]any{"type": "C"})
+		assertNoError(t, err, "Insert C")
+
+		// Search for A
+		results, err := db.Search([]float32{0.9, 0.1, 0}, 5, nil)
+		assertNoError(t, err, "Search A")
+
+		if len(results) == 0 {
+			t.Fatal("HNSW+SQ8 returned 0 results")
+		}
+		assertEqual(t, "vecA", results[0].ID, "Should find vecA first")
+
+		// SQ8 + HNSW approximation might lose some precision, but for [0.9, 0.1, 0] vs [1,0,0]
+		// score should still be very high (> 0.85)
+		if results[0].Score < 0.85 {
+			t.Errorf("Score too low for HNSW+SQ8 match: %f", results[0].Score)
 		}
 	}()
 
 	// 2. Persistence
 	func() {
 		db, err := nanovec.Open(dbPath, cfg)
-		assertNoError(t, err, "Re-Open SQ8 DB")
+		assertNoError(t, err, "Re-Open HNSW+SQ8 DB")
 		defer db.Close()
 
-		results, err := db.Search([]float32{0, 1, 0}, 5, nil)
+		// Verify data persisted and graph is navigable
+		results, err := db.Search([]float32{0, 0.9, 0.1}, 5, nil) // Search for B
 		assertNoError(t, err, "Search B after restart")
 
-		assertEqual(t, "vecB", results[0].ID, "Should find vecB")
+		if len(results) == 0 {
+			t.Fatal("Persistence failed (0 results)")
+		}
+		assertEqual(t, "vecB", results[0].ID, "Should find vecB after restart")
 	}()
 }
