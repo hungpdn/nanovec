@@ -1,9 +1,8 @@
 package storage
 
 import (
-	"bytes"
 	"encoding/binary"
-	"encoding/gob"
+	"encoding/json"
 	"fmt"
 	"math"
 	"time"
@@ -51,7 +50,7 @@ func NewBoltStorage(path string) (*BoltStorage, error) {
 // --- High Performance Serialization Helpers ---
 
 // serializeDocument encodes document to binary format efficiently
-// Format: [Dim(4b)][Vector(dim*4b)][GobMetadata(...)]
+// Format: [Dim(4b)][Vector(dim*4b)][JsonMetadata(...)]
 func serializeDocument(doc *types.Document) ([]byte, error) {
 	dim := len(doc.Vector)
 	vecSize := 4 + dim*4 // 4 bytes for header + data
@@ -70,17 +69,14 @@ func serializeDocument(doc *types.Document) ([]byte, error) {
 		offset += 4
 	}
 
-	// 4. Encode Metadata (Only use Gob for the map)
+	// 4. Encode Metadata (Use JSON for compatibility & safety)
 	if len(doc.Metadata) > 0 {
-		var metaBuf bytes.Buffer
-		enc := gob.NewEncoder(&metaBuf)
-		if err := enc.Encode(doc.Metadata); err != nil {
+		metaBytes, err := json.Marshal(doc.Metadata)
+		if err != nil {
 			return nil, fmt.Errorf("metadata encode failed: %w", err)
 		}
-		// Append metadata bytes to the buffer
-		buf = append(buf, metaBuf.Bytes()...)
+		buf = append(buf, metaBytes...)
 	}
-
 	return buf, nil
 }
 
@@ -111,9 +107,9 @@ func deserializeDocument(id string, data []byte) (*types.Document, error) {
 	// 3. Read Metadata (if any bytes left)
 	var meta map[string]any
 	if len(data) > expectedVecSize {
-		metaBuf := bytes.NewBuffer(data[expectedVecSize:])
-		dec := gob.NewDecoder(metaBuf)
-		if err := dec.Decode(&meta); err != nil {
+		// Just unmarshal the rest of the slice
+		// Note: Numbers will be unmarshaled as float64 by default in JSON
+		if err := json.Unmarshal(data[expectedVecSize:], &meta); err != nil {
 			return nil, fmt.Errorf("metadata decode failed: %w", err)
 		}
 	}
@@ -242,7 +238,6 @@ func (s *BoltStorage) Get(id string) (*types.Document, error) {
 			return fmt.Errorf("document not found: %s", id)
 		}
 
-		// FAST DECODING
 		var err error
 		doc, err = deserializeDocument(id, data)
 		if err != nil {
@@ -297,7 +292,6 @@ func (s *BoltStorage) Scan(fn func(doc *types.Document) error) error {
 				continue
 			}
 
-			// FAST DECODING using the key 'k' as the ID
 			doc, err := deserializeDocument(string(k), v)
 			if err != nil {
 				return fmt.Errorf("corrupt data for id %s: %v", k, err)

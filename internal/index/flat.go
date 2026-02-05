@@ -1,9 +1,9 @@
 package index
 
 import (
+	"bufio"
 	"container/heap"
 	"encoding/binary"
-	"encoding/gob"
 	"fmt"
 	"os"
 	"slices"
@@ -223,19 +223,30 @@ func (idx *FlatIndex[T]) Save(path string) error {
 	}
 	defer f.Close()
 
+	w := bufio.NewWriterSize(f, 64*types.KB)
+
 	header := make([]int32, 2)
 	header[0] = int32(idx.dim)
 	header[1] = int32(len(idx.IDs))
-	if err := binary.Write(f, binary.LittleEndian, header); err != nil {
+
+	// Write Header to Buffer
+	if err := binary.Write(w, binary.LittleEndian, header); err != nil {
 		return err
 	}
 
-	enc := gob.NewEncoder(f)
-	if err := idx.SaveBase(enc); err != nil {
+	// Write Base (IDs + Metadata) to Buffer
+	// SaveBase accepts io.Writer, so wrapping it in bufio works perfectly.
+	if err := idx.SaveBase(w); err != nil {
 		return err
 	}
 
-	if err := binary.Write(f, binary.LittleEndian, idx.RawVectors); err != nil {
+	// Write Vectors to Buffer
+	if err := binary.Write(w, binary.LittleEndian, idx.RawVectors); err != nil {
+		return err
+	}
+
+	// Flush buffer to disk before Sync
+	if err := w.Flush(); err != nil {
 		return err
 	}
 
@@ -259,20 +270,24 @@ func (idx *FlatIndex[T]) Load(path string) error {
 	}
 	defer f.Close()
 
+	r := bufio.NewReaderSize(f, 64*types.KB)
+
 	header := make([]int32, 2)
-	if err := binary.Read(f, binary.LittleEndian, &header); err != nil {
+	// Read Header from Buffer
+	if err := binary.Read(r, binary.LittleEndian, &header); err != nil {
 		return err
 	}
 	idx.dim = int(header[0])
 	count := int(header[1])
 
-	dec := gob.NewDecoder(f)
-	if err := idx.LoadBase(dec); err != nil {
+	// Read Base from Buffer
+	if err := idx.LoadBase(r); err != nil {
 		return err
 	}
 
 	idx.RawVectors = make([]T, count*idx.dim)
-	if err := binary.Read(f, binary.LittleEndian, &idx.RawVectors); err != nil {
+	// Read Vectors from Buffer
+	if err := binary.Read(r, binary.LittleEndian, &idx.RawVectors); err != nil {
 		return err
 	}
 	return nil

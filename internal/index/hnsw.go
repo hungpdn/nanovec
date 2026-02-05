@@ -1,15 +1,17 @@
 package index
 
 import (
+	"bufio"
+	"cmp"
 	"container/heap"
 	"encoding/binary"
-	"encoding/gob"
+	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"runtime"
 	"slices"
-	"sort"
 	"sync"
 
 	"github.com/hungpdn/nanovec/pkg/bitset"
@@ -147,12 +149,12 @@ func (idx *HNSWIndex[T]) Add(id string, vec types.Vector, meta map[string]any) e
 	idx.Metadata[id] = meta
 
 	// Update entry point if needed
+	updateEP := false
 	if idx.enterPoint == -1 {
 		idx.enterPoint = internalID
 		idx.maxLevel = level
 	} else if level > idx.maxLevel {
-		idx.maxLevel = level
-		idx.enterPoint = internalID
+		updateEP = true
 	}
 
 	// Release Global Lock immediately!
@@ -160,8 +162,20 @@ func (idx *HNSWIndex[T]) Add(id string, vec types.Vector, meta map[string]any) e
 	idx.mu.Unlock()
 
 	// Phase 2: Parallel Linking (Fine-Grained)
+	idx.mu.RLock()
 	idx.parallelLink(ctx, node, navQuery)
+	idx.mu.RUnlock()
 
+	// Phase 3: Finalize state (global lock)
+	if updateEP {
+		idx.mu.Lock()
+		// Check again in case another thread updated it higher
+		if level > idx.maxLevel {
+			idx.maxLevel = level
+			idx.enterPoint = internalID
+		}
+		idx.mu.Unlock()
+	}
 	return nil
 }
 
@@ -240,6 +254,7 @@ func (idx *HNSWIndex[T]) AddBatch(ids []string, vecs []types.Vector, metas []map
 	idx.mu.Unlock()
 
 	// Phase 2: Parallel Linking (Fine-Grained)
+	idx.mu.RLock()
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, runtime.GOMAXPROCS(0))
 
@@ -262,6 +277,7 @@ func (idx *HNSWIndex[T]) AddBatch(ids []string, vecs []types.Vector, metas []map
 		}(i)
 	}
 	wg.Wait()
+	idx.mu.RUnlock()
 
 	// Phase 3: Finalize Global State
 	// Update EP only after connections are established to avoid "Island Nodes"
@@ -407,13 +423,23 @@ func (idx *HNSWIndex[T]) searchLayerLocked(ctx *searchCtx, query types.Vector, e
 
 		// Lock node to read neighbors
 		node := idx.nodes[curr.id]
+		// Fast Copy Neighbors (Critical Section - Very Short)
+		// We copy the slice so we can release the lock immediately.
+		// node.Neighbors[level] usage inside lock is safe.
+		// Allocation here is cheap compared to holding lock during distance calc.
+		// To further optimize, we could reuse a buffer from ctx, but a small slice alloc is negligible.
 		node.mu.RLock()
+		neighbors := make([]int, len(node.Neighbors[level]))
+		copy(neighbors, node.Neighbors[level])
+		node.mu.RUnlock()
 
 		// Iterate neighbors directly inside lock is okay if callback is fast
-		for _, neighborID := range idx.nodes[curr.id].Neighbors[level] {
+		for _, neighborID := range neighbors {
 			if ctx.visitedList[neighborID] != ctx.visitedToken {
 				ctx.visitedList[neighborID] = ctx.visitedToken
 
+				// Heavy math calculation happens here, fully parallel
+				// No other threads are blocked on 'node' while we do this
 				dist := idx.distQueryFunc(query, idx.nodes[neighborID].Vec)
 				newItem := pqItem{id: neighborID, score: dist}
 
@@ -426,8 +452,6 @@ func (idx *HNSWIndex[T]) searchLayerLocked(ctx *searchCtx, query types.Vector, e
 				}
 			}
 		}
-
-		node.mu.RUnlock()
 	}
 }
 
@@ -531,8 +555,8 @@ func (idx *HNSWIndex[T]) Search(query types.Vector, k int, filter types.FilterFu
 	idx.searchLayerLocked(searchCtx, normalizedQuery, currObj, efSearch, 0)
 
 	candidates := *searchCtx.results
-	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].score > candidates[j].score
+	slices.SortFunc(candidates, func(a, b pqItem) int {
+		return cmp.Compare(b.score, a.score)
 	})
 
 	results := make([]types.SearchResult, 0, k)
@@ -582,7 +606,7 @@ func (idx *HNSWIndex[T]) Delete(id string) error {
 // but for simplicity in generics, we can export fields on Node[T] and use it directly.
 // In the code above, Node[T] fields are Exported.
 
-// Save
+// Save stores the index to disk using Buffered I/O + Binary + JSON
 func (idx *HNSWIndex[T]) Save(path string) error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
@@ -594,62 +618,60 @@ func (idx *HNSWIndex[T]) Save(path string) error {
 	}
 	defer f.Close()
 
-	enc := gob.NewEncoder(f)
-	if err := enc.Encode(idx.Version); err != nil {
+	w := bufio.NewWriterSize(f, 64*types.KB)
+
+	// 1. Header Params (Write to 'w' instead of 'f')
+	if err := binary.Write(w, binary.LittleEndian, idx.Version); err != nil {
 		return err
 	}
-	if err := enc.Encode(idx.dim); err != nil {
+	if err := binary.Write(w, binary.LittleEndian, int32(idx.dim)); err != nil {
 		return err
 	}
-	if err := enc.Encode(idx.M); err != nil {
+	if err := binary.Write(w, binary.LittleEndian, int32(idx.M)); err != nil {
 		return err
 	}
-	if err := enc.Encode(idx.EfConstruction); err != nil {
+	if err := binary.Write(w, binary.LittleEndian, int32(idx.EfConstruction)); err != nil {
 		return err
 	}
-	if err := enc.Encode(idx.LevelMult); err != nil {
+	if err := binary.Write(w, binary.LittleEndian, idx.LevelMult); err != nil {
 		return err
 	}
-	if err := enc.Encode(idx.enterPoint); err != nil {
+	if err := binary.Write(w, binary.LittleEndian, int32(idx.enterPoint)); err != nil {
 		return err
 	}
-	if err := enc.Encode(idx.maxLevel); err != nil {
+	if err := binary.Write(w, binary.LittleEndian, int32(idx.maxLevel)); err != nil {
 		return err
 	}
 
 	count := len(idx.nodes)
-	if err := enc.Encode(count); err != nil {
+	if err := binary.Write(w, binary.LittleEndian, int32(count)); err != nil {
 		return err
 	}
 
-	// Save Nodes
-	// ID: [Len (4b)] [Bytes...]
-	// Level: [Level (4b)]
-	// Neighbors: [NumLayers (4b)] -> Loop: [LayerCount (4b)] -> [NeighborIDs... (4b each)]
-	// Vector: [Binary Data]
+	// 2. Nodes (Write to 'w')
 	neighborBuf := make([]int32, 0, idx.MMax0)
 	for _, node := range idx.nodes {
 
 		idBytes := []byte(node.ID)
-		if err := binary.Write(f, binary.LittleEndian, int32(len(idBytes))); err != nil {
+		if err := binary.Write(w, binary.LittleEndian, int32(len(idBytes))); err != nil {
 			return err
 		}
-		if _, err := f.Write(idBytes); err != nil {
+		if _, err := w.Write(idBytes); err != nil {
 			return err
 		}
 
-		if err := binary.Write(f, binary.LittleEndian, int32(node.Level)); err != nil {
+		if err := binary.Write(w, binary.LittleEndian, int32(node.Level)); err != nil {
 			return err
 		}
 
 		numLayers := int32(len(node.Neighbors))
-		if err := binary.Write(f, binary.LittleEndian, numLayers); err != nil {
+		if err := binary.Write(w, binary.LittleEndian, numLayers); err != nil {
 			return err
 		}
 
 		for _, layer := range node.Neighbors {
 			layerCount := int32(len(layer))
-			if err := binary.Write(f, binary.LittleEndian, layerCount); err != nil {
+			if err := binary.Write(w, binary.LittleEndian, layerCount); err != nil {
 				return err
 			}
 
@@ -657,41 +679,54 @@ func (idx *HNSWIndex[T]) Save(path string) error {
 			for _, nID := range layer {
 				neighborBuf = append(neighborBuf, int32(nID))
 			}
-
-			if err := binary.Write(f, binary.LittleEndian, neighborBuf); err != nil {
+			// Write neighbors as a block
+			if err := binary.Write(w, binary.LittleEndian, neighborBuf); err != nil {
 				return err
 			}
 		}
 
+		// Optimized Vector Write
 		switch v := any(node.Vec).(type) {
 		case []float32:
-			if err := binary.Write(f, binary.LittleEndian, v); err != nil {
+			if err := binary.Write(w, binary.LittleEndian, v); err != nil {
 				return err
 			}
 		case []uint8:
-			if _, err := f.Write(v); err != nil {
+			if _, err := w.Write(v); err != nil {
 				return err
 			}
 		default:
-			if err := binary.Write(f, binary.LittleEndian, node.Vec); err != nil {
+			if err := binary.Write(w, binary.LittleEndian, node.Vec); err != nil {
 				return err
 			}
 		}
 	}
 
-	if err := enc.Encode(idx.Metadata); err != nil {
+	// 3. Metadata (JSON) to 'w'
+	metaBytes, err := json.Marshal(idx.Metadata)
+	if err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.LittleEndian, int32(len(metaBytes))); err != nil {
+		return err
+	}
+	if _, err := w.Write(metaBytes); err != nil {
 		return err
 	}
 
-	// Save Tombstones (BitSet)
-	// Format: [Size(4b)] [DataLen(4b)] [Data([]uint64)]
-	if err := binary.Write(f, binary.LittleEndian, int32(idx.tombstones.Size)); err != nil {
+	// 4. Tombstones (Binary) to 'w'
+	if err := binary.Write(w, binary.LittleEndian, int32(idx.tombstones.Size)); err != nil {
 		return err
 	}
-	if err := binary.Write(f, binary.LittleEndian, int32(len(idx.tombstones.Data))); err != nil {
+	if err := binary.Write(w, binary.LittleEndian, int32(len(idx.tombstones.Data))); err != nil {
 		return err
 	}
-	if err := binary.Write(f, binary.LittleEndian, idx.tombstones.Data); err != nil {
+	if err := binary.Write(w, binary.LittleEndian, idx.tombstones.Data); err != nil {
+		return err
+	}
+
+	// IMPORTANT: Flush buffer to disk
+	if err := w.Flush(); err != nil {
 		return err
 	}
 
@@ -704,6 +739,7 @@ func (idx *HNSWIndex[T]) Save(path string) error {
 	return os.Rename(tmpPath, path)
 }
 
+// Load loads the index from disk using Buffered I/O + Binary + JSON
 func (idx *HNSWIndex[T]) Load(path string) error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
@@ -720,97 +756,98 @@ func (idx *HNSWIndex[T]) Load(path string) error {
 	}
 	fileSize := fi.Size()
 
-	dec := gob.NewDecoder(f)
-	if err := dec.Decode(&idx.Version); err != nil {
+	r := bufio.NewReaderSize(f, 64*types.KB)
+
+	// 1. Header (Read from 'r' instead of 'f')
+	if err := binary.Read(r, binary.LittleEndian, &idx.Version); err != nil {
 		return err
 	}
-	if err := dec.Decode(&idx.dim); err != nil {
+
+	var dim32, m32, ef32, ep32, maxLvl32, count32 int32
+	if err := binary.Read(r, binary.LittleEndian, &dim32); err != nil {
 		return err
 	}
-	if err := dec.Decode(&idx.M); err != nil {
+	idx.dim = int(dim32)
+
+	if err := binary.Read(r, binary.LittleEndian, &m32); err != nil {
 		return err
 	}
+	idx.M = int(m32)
 	idx.MMax0 = idx.M * 2
-	if err := dec.Decode(&idx.EfConstruction); err != nil {
-		return err
-	}
-	if err := dec.Decode(&idx.LevelMult); err != nil {
-		return err
-	}
-	if err := dec.Decode(&idx.enterPoint); err != nil {
-		return err
-	}
-	if err := dec.Decode(&idx.maxLevel); err != nil {
-		return err
-	}
 
-	var count int
-	if err := dec.Decode(&count); err != nil {
+	if err := binary.Read(r, binary.LittleEndian, &ef32); err != nil {
 		return err
 	}
+	idx.EfConstruction = int(ef32)
 
+	if err := binary.Read(r, binary.LittleEndian, &idx.LevelMult); err != nil {
+		return err
+	} // float64
+
+	if err := binary.Read(r, binary.LittleEndian, &ep32); err != nil {
+		return err
+	}
+	idx.enterPoint = int(ep32)
+
+	if err := binary.Read(r, binary.LittleEndian, &maxLvl32); err != nil {
+		return err
+	}
+	idx.maxLevel = int(maxLvl32)
+
+	if err := binary.Read(r, binary.LittleEndian, &count32); err != nil {
+		return err
+	}
+	count := int(count32)
+
+	// Sanity Checks
 	if count < 0 {
 		return fmt.Errorf("corrupted file: negative node count %d", count)
 	}
-
-	if count > 100_000_000 {
-		return fmt.Errorf("node count exceeds limit")
-	}
-
 	minBytesPerNode := int64(12 + idx.dim)
 	minRequiredSize := int64(count) * minBytesPerNode
 	if fileSize < minRequiredSize {
-		return fmt.Errorf("corrupted file: node count %d requires at least %d bytes, but file is only %d bytes",
-			count, minRequiredSize, fileSize)
+		return fmt.Errorf("corrupted file: too small")
 	}
 
 	idx.nodes = make([]*Node[T], count)
 	idx.idMap = make(map[string]int)
 
+	// 2. Nodes (Read from 'r')
+	nodePool := make([]Node[T], count)
 	for i := 0; i < count; i++ {
 		var idLen int32
-		if err := binary.Read(f, binary.LittleEndian, &idLen); err != nil {
+		if err := binary.Read(r, binary.LittleEndian, &idLen); err != nil {
 			return err
 		}
-
-		if idLen < 0 || idLen > types.KB {
-			return fmt.Errorf("corrupted file: invalid id length %d at index %d", idLen, i)
+		if idLen < 0 || idLen > 4096 {
+			return fmt.Errorf("invalid id len")
 		}
 
 		idBytes := make([]byte, idLen)
-		if _, err := f.Read(idBytes); err != nil {
+		if _, err := io.ReadFull(r, idBytes); err != nil {
 			return err
 		}
 		id := string(idBytes)
 
 		var level int32
-		if err := binary.Read(f, binary.LittleEndian, &level); err != nil {
+		if err := binary.Read(r, binary.LittleEndian, &level); err != nil {
 			return err
 		}
 
 		var numLayers int32
-		if err := binary.Read(f, binary.LittleEndian, &numLayers); err != nil {
+		if err := binary.Read(r, binary.LittleEndian, &numLayers); err != nil {
 			return err
-		}
-
-		if numLayers < 0 || numLayers > 100 {
-			return fmt.Errorf("corrupted file: invalid numLayers %d at index %d", numLayers, i)
 		}
 
 		neighbors := make([][]int, numLayers)
 		for l := 0; l < int(numLayers); l++ {
 			var layerCount int32
-			if err := binary.Read(f, binary.LittleEndian, &layerCount); err != nil {
+			if err := binary.Read(r, binary.LittleEndian, &layerCount); err != nil {
 				return err
 			}
 
-			// Check Layer Count sanity (cannot be much greater than MMax0)
-			if layerCount < 0 || layerCount > 10000 {
-				return fmt.Errorf("corrupted file: invalid layerCount %d at index %d layer %d", layerCount, i, l)
-			}
-
 			layerInt32 := make([]int32, layerCount)
-			if err := binary.Read(f, binary.LittleEndian, &layerInt32); err != nil {
+			if err := binary.Read(r, binary.LittleEndian, &layerInt32); err != nil {
 				return err
 			}
 
@@ -824,60 +861,70 @@ func (idx *HNSWIndex[T]) Load(path string) error {
 		vec := make([]T, idx.dim)
 		switch v := any(vec).(type) {
 		case []float32:
-			if err := binary.Read(f, binary.LittleEndian, v); err != nil {
+			if err := binary.Read(r, binary.LittleEndian, v); err != nil {
 				return err
 			}
 		case []uint8:
-			if _, err := f.Read(v); err != nil {
+			if _, err := io.ReadFull(r, v); err != nil {
 				return err
 			}
 		default:
-			if err := binary.Read(f, binary.LittleEndian, &vec); err != nil {
+			if err := binary.Read(r, binary.LittleEndian, &vec); err != nil {
 				return err
 			}
 		}
 
-		node := &Node[T]{
-			ID:        id,
-			Vec:       vec,
-			Level:     int(level),
-			Neighbors: neighbors,
-		}
+		node := &nodePool[i]
+		node.ID = id
+		node.Vec = vec
+		node.Level = int(level)
+		node.Neighbors = neighbors
+
 		idx.nodes[i] = node
 		idx.idMap[node.ID] = i
 	}
 
+	// 3. Metadata (JSON) from 'r'
+	var metaLen int32
+	if err := binary.Read(r, binary.LittleEndian, &metaLen); err != nil {
+		return err
+	}
+	if metaLen < 0 {
+		return fmt.Errorf("invalid meta len")
+	}
+
+	metaBytes := make([]byte, metaLen)
+	if _, err := io.ReadFull(r, metaBytes); err != nil {
+		return err
+	}
+
 	idx.Metadata = make(map[string]map[string]any)
-	if err := dec.Decode(&idx.Metadata); err != nil {
+	if err := json.Unmarshal(metaBytes, &idx.Metadata); err != nil {
 		return err
 	}
 
-	// Load Tombstones
-	var tsSize int32
-	if err := binary.Read(f, binary.LittleEndian, &tsSize); err != nil {
+	// 4. Tombstones (Binary) from 'r'
+	var tsSize, tsDataLen int32
+	if err := binary.Read(r, binary.LittleEndian, &tsSize); err != nil {
 		return err
 	}
-
-	var tsDataLen int32
-	if err := binary.Read(f, binary.LittleEndian, &tsDataLen); err != nil {
+	if err := binary.Read(r, binary.LittleEndian, &tsDataLen); err != nil {
 		return err
 	}
 
 	tsData := make([]uint64, tsDataLen)
-	if err := binary.Read(f, binary.LittleEndian, &tsData); err != nil {
+	if err := binary.Read(r, binary.LittleEndian, &tsData); err != nil {
 		return err
 	}
 
-	idx.tombstones = &bitset.BitSet{
-		Size: int(tsSize),
-		Data: tsData,
-	}
+	idx.tombstones = &bitset.BitSet{Size: int(tsSize), Data: tsData}
 
-	// Clean dead IDs
+	// Clean ghosts
 	for id := range idx.idMap {
-		if _, isLive := idx.Metadata[id]; !isLive {
+		if _, ok := idx.Metadata[id]; !ok {
 			delete(idx.idMap, id)
 		}
 	}
+
 	return nil
 }

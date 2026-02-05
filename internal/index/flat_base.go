@@ -1,7 +1,9 @@
 package index
 
 import (
-	"encoding/gob"
+	"encoding/binary"
+	"encoding/json"
+	"io"
 	"sync"
 
 	"github.com/hungpdn/nanovec/pkg/errors"
@@ -98,23 +100,90 @@ func (idx *BaseIndex) GetVersion() uint64 {
 	return idx.Version
 }
 
-// SaveBase: save common sections (IDs, Metadata)
-func (b *BaseIndex) SaveBase(enc *gob.Encoder) error {
-	// Gob auto save public field: IDs, Metadata
-	return enc.Encode(b)
-}
+// SaveBase: save common sections (IDs, Metadata) using BINARY + JSON (No Gob)
+func (b *BaseIndex) SaveBase(w io.Writer) error {
 
-// LoadBase read common sections (IDs, Metadata) and rebuild idMap
-func (b *BaseIndex) LoadBase(dec *gob.Decoder) error {
-	// Gob auto map data from file into struct
-	if err := dec.Decode(b); err != nil {
+	count := int32(len(b.IDs))
+	if err := binary.Write(w, binary.LittleEndian, count); err != nil {
+		return err
+	}
+	for _, id := range b.IDs {
+		idBytes := []byte(id)
+		if err := binary.Write(w, binary.LittleEndian, int32(len(idBytes))); err != nil {
+			return err
+		}
+		if _, err := w.Write(idBytes); err != nil {
+			return err
+		}
+	}
+
+	if err := binary.Write(w, binary.LittleEndian, b.Version); err != nil {
 		return err
 	}
 
-	b.idMap = make(map[string]int, len(b.IDs))
-	for i, id := range b.IDs {
+	metaJSON, err := json.Marshal(b.Metadata)
+	if err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.LittleEndian, int32(len(metaJSON))); err != nil {
+		return err
+	}
+	if _, err := w.Write(metaJSON); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// LoadBase read common sections (IDs, Metadata) and rebuild idMap
+func (b *BaseIndex) LoadBase(r io.Reader) error {
+	var count int32
+	if err := binary.Read(r, binary.LittleEndian, &count); err != nil {
+		return err
+	}
+
+	b.IDs = make([]string, count)
+	b.idMap = make(map[string]int, count)
+
+	for i := 0; i < int(count); i++ {
+		var idLen int32
+		if err := binary.Read(r, binary.LittleEndian, &idLen); err != nil {
+			return err
+		}
+		if idLen < 0 || idLen > 4096 {
+			return errors.ErrDimMismatch
+		}
+
+		idBytes := make([]byte, idLen)
+		if _, err := io.ReadFull(r, idBytes); err != nil {
+			return err
+		}
+		id := string(idBytes)
+		b.IDs[i] = id
 		b.idMap[id] = i
 	}
+
+	if err := binary.Read(r, binary.LittleEndian, &b.Version); err != nil {
+		return err
+	}
+
+	var metaLen int32
+	if err := binary.Read(r, binary.LittleEndian, &metaLen); err != nil {
+		return err
+	}
+	if metaLen < 0 {
+		return errors.ErrDimMismatch
+	}
+
+	metaJSON := make([]byte, metaLen)
+	if _, err := io.ReadFull(r, metaJSON); err != nil {
+		return err
+	}
+
+	if err := json.Unmarshal(metaJSON, &b.Metadata); err != nil {
+		return err
+	}
+
 	return nil
 }
 
