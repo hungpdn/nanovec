@@ -147,11 +147,11 @@ func (idx *HNSWIndex[T]) Add(id string, vec types.Vector, meta map[string]any) e
 
 	neighbors := make([][]int, level+1)
 	for i := 0; i <= level; i++ {
-		cap := idx.M
+		capN := idx.M
 		if i == 0 {
-			cap = idx.MMax0
+			capN = idx.MMax0
 		}
-		neighbors[i] = make([]int, 0, cap)
+		neighbors[i] = make([]int, 0, capN)
 	}
 
 	node := &Node[T]{
@@ -278,11 +278,11 @@ func (idx *HNSWIndex[T]) AddBatch(ids []string, vecs []types.Vector, metas []map
 
 		neighbors := make([][]int, level+1)
 		for l := 0; l <= level; l++ {
-			cap := idx.M
+			capN := idx.M
 			if l == 0 {
-				cap = idx.MMax0
+				capN = idx.MMax0
 			}
-			neighbors[l] = make([]int, 0, cap)
+			neighbors[l] = make([]int, 0, capN)
 		}
 
 		node := &nodeArena[i]
