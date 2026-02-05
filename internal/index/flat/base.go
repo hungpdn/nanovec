@@ -75,6 +75,16 @@ func (b *BaseIndex) CommitDelete(id string, pos, lastIndex int) {
 	b.IDs = b.IDs[:lastIndex]
 }
 
+// Dim
+func (idx *BaseIndex) Dim() int { return idx.dim }
+
+// Count
+func (idx *BaseIndex) Count() int {
+	idx.RLock()
+	defer idx.RUnlock()
+	return len(idx.IDs)
+}
+
 // SaveBase: save common sections (IDs, Metadata)
 func (b *BaseIndex) SaveBase(enc *gob.Encoder) error {
 	// Gob auto save public field: IDs, Metadata

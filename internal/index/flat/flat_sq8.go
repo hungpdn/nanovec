@@ -168,16 +168,6 @@ func (idx *FlatIndexSQ8) Delete(id string) error {
 	return nil
 }
 
-// Count
-func (idx *FlatIndexSQ8) Count() int {
-	idx.RLock()
-	defer idx.RUnlock()
-	return len(idx.IDs)
-}
-
-// Dim
-func (idx *FlatIndexSQ8) Dim() int { return idx.dim }
-
 // Save
 func (idx *FlatIndexSQ8) Save(path string) error {
 	idx.Lock()
@@ -198,14 +188,9 @@ func (idx *FlatIndexSQ8) Save(path string) error {
 	}
 
 	enc := gob.NewEncoder(f)
-	if err := enc.Encode(idx.IDs); err != nil {
+	if err := idx.SaveBase(enc); err != nil {
 		return err
 	}
-	if err := enc.Encode(idx.Metadata); err != nil {
-		return err
-	}
-
-	// Save Raw uint8 vectors
 	if err := enc.Encode(idx.RawVectors); err != nil {
 		return err
 	}
@@ -241,15 +226,9 @@ func (idx *FlatIndexSQ8) Load(path string) error {
 	}
 
 	idx.Metadata = make(map[string]map[string]any)
-	if err := dec.Decode(&idx.Metadata); err != nil {
+	if err := idx.LoadBase(dec); err != nil {
 		return err
 	}
-
-	idx.idMap = make(map[string]int, len(idx.IDs))
-	for i, id := range idx.IDs {
-		idx.idMap[id] = i
-	}
-
 	// Load Raw uint8 vectors
 	if err := dec.Decode(&idx.RawVectors); err != nil {
 		return err

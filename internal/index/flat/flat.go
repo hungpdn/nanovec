@@ -165,16 +165,6 @@ func (idx *FlatIndex) Delete(id string) error {
 	return nil
 }
 
-// Count
-func (idx *FlatIndex) Count() int {
-	idx.RLock()
-	defer idx.RUnlock()
-	return len(idx.IDs)
-}
-
-// Dim
-func (idx *FlatIndex) Dim() int { return idx.dim }
-
 // Save save data into disk
 func (idx *FlatIndex) Save(path string) error {
 	idx.Lock()
