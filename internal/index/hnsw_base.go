@@ -19,16 +19,13 @@ type searchCtx struct {
 	rng *rand.Rand
 }
 
-func newSearchCtx() *searchCtx {
+func newSearchCtx(neighborCap int) *searchCtx {
 	c := &MaxHeap{}
 	r := &MinHeap{}
 	heap.Init(c)
 	heap.Init(r)
 
-	// Initialize a thread-local RNG.
-	// We use PCG or ChaCha8 which are fast.
-	// We seed it using the global generator once upon creation.
-	// Note: rand.Uint64() uses the global source, but this happens rarely (only on pool creation).
+	// Initialize a thread-local RNG
 	rSource := rand.NewPCG(rand.Uint64(), rand.Uint64())
 
 	return &searchCtx{
@@ -36,7 +33,7 @@ func newSearchCtx() *searchCtx {
 		visitedToken: 0,
 		candidates:   c,
 		results:      r,
-		neighborBuf:  make([]int, 0, 64),
+		neighborBuf:  make([]int, 0, neighborCap),
 		rng:          rand.New(rSource),
 	}
 }
@@ -118,4 +115,28 @@ func (idx *HNSWIndex[T]) selectNeighborsFromHeap(ctx *searchCtx, h *MinHeap, m i
 
 	// Return a slice backing the reusable buffer
 	return ctx.neighborBuf[start:]
+}
+
+func (idx *HNSWIndex[T]) Count() int {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return len(idx.idMap)
+}
+
+func (idx *HNSWIndex[T]) Dim() int {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return idx.dim
+}
+
+func (idx *HNSWIndex[T]) SetVersion(v uint64) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	idx.Version = v
+}
+
+func (idx *HNSWIndex[T]) GetVersion() uint64 {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	return idx.Version
 }

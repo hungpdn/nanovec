@@ -7,10 +7,10 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"runtime"
 	"slices"
 	"sync"
 
-	"github.com/hungpdn/nanovec/pkg/errors"
 	"github.com/hungpdn/nanovec/pkg/maths"
 	"github.com/hungpdn/nanovec/pkg/types"
 )
@@ -52,7 +52,8 @@ type Node[T types.Number] struct {
 	ID        string
 	Vec       []T
 	Level     int
-	Neighbors [][]int // [level][neighbor_internal_index]
+	Neighbors [][]int      // [level][neighbor_internal_index]
+	mu        sync.RWMutex // Fine-grained lock for this specific node
 }
 
 func newHNSWIndex[T types.Number](dim, m, efConstruction int,
@@ -76,7 +77,7 @@ func newHNSWIndex[T types.Number](dim, m, efConstruction int,
 		distNodeFunc:   distN,
 		searchCtxPool: &sync.Pool{
 			New: func() any {
-				return newSearchCtx()
+				return newSearchCtx(m * 2)
 			},
 		},
 	}
@@ -107,63 +108,26 @@ func NewHNSWIndexSQ8(dim, m, efConstruction int) *HNSWIndex[uint8] {
 	)
 }
 
-// Add inserts a vector into the HNSW graph
+// Add inserts a single vector into the HNSW graph (Thread-safe & Compatible with Parallel AddBatch)
 func (idx *HNSWIndex[T]) Add(id string, vec types.Vector, meta map[string]any) error {
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
+	ctx := idx.searchCtxPool.Get().(*searchCtx)
+	defer idx.searchCtxPool.Put(ctx)
 
+	// --- PHASE 1: PRE-ALLOCATION (Global Lock) ---
+	idx.mu.Lock()
+
+	// Check duplicates
 	if _, exists := idx.idMap[id]; exists {
+		idx.mu.Unlock()
 		return fmt.Errorf("id %s already exists", id)
 	}
-	return idx.internalAdd(id, vec, meta, nil)
-}
 
-// AddBatch adds multiple vectors
-func (idx *HNSWIndex[T]) AddBatch(ids []string, vecs []types.Vector, metas []map[string]any) error {
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
-
-	for _, id := range ids {
-		if _, exists := idx.idMap[id]; exists {
-			return fmt.Errorf("id %s already exists", id)
-		}
-	}
-
-	idx.nodes = slices.Grow(idx.nodes, len(ids))
-	scratch := make([]float32, idx.dim)
-
-	for i, id := range ids {
-		if err := idx.internalAdd(id, vecs[i], metas[i], scratch); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// internalAdd is the core Add logic without Locking (Helper)
-func (idx *HNSWIndex[T]) internalAdd(id string, vec types.Vector, meta map[string]any, scratch []float32) error {
-	if len(vec) != idx.dim {
-		return errors.ErrDimMismatch
-	}
-
-	searchCtx := idx.searchCtxPool.Get().(*searchCtx)
-	defer idx.searchCtxPool.Put(searchCtx)
-
-	var navQuery []float32
-	if scratch != nil {
-		navQuery = scratch
-	} else {
-		navQuery = make([]float32, len(vec))
-	}
-
+	navQuery := make([]float32, len(vec))
 	copy(navQuery, vec)
 	maths.NormalizeInPlace(navQuery)
-
 	storedVec := idx.convertFunc(navQuery)
 
-	level := searchCtx.randomLevel()
-	internalID := len(idx.nodes)
-
+	level := ctx.randomLevel()
 	node := &Node[T]{
 		ID:        id,
 		Vec:       storedVec,
@@ -171,26 +135,146 @@ func (idx *HNSWIndex[T]) internalAdd(id string, vec types.Vector, meta map[strin
 		Neighbors: make([][]int, level+1),
 	}
 
+	// Update Global State
+	internalID := len(idx.nodes)
 	idx.nodes = append(idx.nodes, node)
 	idx.idMap[id] = internalID
 	idx.Metadata[id] = meta
 
+	// Update entry point if needed
 	if idx.enterPoint == -1 {
 		idx.enterPoint = internalID
 		idx.maxLevel = level
-		return nil
+	} else if level > idx.maxLevel {
+		idx.maxLevel = level
+		idx.enterPoint = internalID
 	}
 
-	currObj := idx.enterPoint
-	currDist := idx.distQueryFunc(navQuery, idx.nodes[currObj].Vec)
+	// Release Global Lock immediately!
+	// So that other threads (Search or AddBatch) can continue running
+	idx.mu.Unlock()
 
-	// Greedy search
-	for l := idx.maxLevel; l > level; l-- {
+	// --- PHASE 2: LINKING (Fine-Grained Lock) ---
+	idx.parallelLink(ctx, node, navQuery)
+
+	return nil
+}
+
+// AddBatch adds multiple vectors
+func (idx *HNSWIndex[T]) AddBatch(ids []string, vecs []types.Vector, metas []map[string]any) error {
+	// --- PHASE 1: PRE-ALLOCATION (Global Lock) ---
+	idx.mu.Lock()
+
+	for _, id := range ids {
+		if _, exists := idx.idMap[id]; exists {
+			idx.mu.Unlock()
+			return fmt.Errorf("id %s already exists", id)
+		}
+	}
+
+	startIdx := len(idx.nodes)
+	count := len(ids)
+	idx.nodes = slices.Grow(idx.nodes, count)
+
+	rngCtx := idx.searchCtxPool.Get().(*searchCtx)
+
+	newNodes := make([]*Node[T], count)
+	normalizedVecs := make([][]float32, count)
+
+	for i := 0; i < count; i++ {
+		// Normalize
+		nv := make([]float32, idx.dim)
+		copy(nv, vecs[i])
+		maths.NormalizeInPlace(nv)
+		normalizedVecs[i] = nv
+
+		storedVec := idx.convertFunc(nv)
+
+		level := rngCtx.randomLevel()
+
+		node := &Node[T]{
+			ID:        ids[i],
+			Vec:       storedVec,
+			Level:     level,
+			Neighbors: make([][]int, level+1),
+		}
+
+		// Update Global State
+		internalID := startIdx + i
+		idx.nodes = append(idx.nodes, node)
+		idx.idMap[ids[i]] = internalID
+		idx.Metadata[ids[i]] = metas[i]
+		newNodes[i] = node
+
+		// Update maxLevel globally
+		if level > idx.maxLevel {
+			idx.maxLevel = level
+			idx.enterPoint = internalID // Simplification: New highest node becomes EP
+		}
+	}
+
+	idx.searchCtxPool.Put(rngCtx)
+
+	// Release Global Lock immediately
+	// Now other readers can access existing nodes, and we can link new nodes in parallel
+	idx.mu.Unlock()
+
+	// --- PHASE 2: PARALLEL LINKING (Fine-Grained) ---
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, runtime.GOMAXPROCS(0))
+
+	for i := 0; i < count; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			node := newNodes[i]
+			qVec := normalizedVecs[i]
+
+			workerCtx := idx.searchCtxPool.Get().(*searchCtx)
+			defer idx.searchCtxPool.Put(workerCtx)
+
+			idx.parallelLink(workerCtx, node, qVec)
+
+		}(i)
+	}
+	wg.Wait()
+
+	return nil
+}
+
+// parallelLink inserts a node into the graph using fine-grained locking
+func (idx *HNSWIndex[T]) parallelLink(ctx *searchCtx, node *Node[T], query []float32) {
+	// We read enterPoint atomically (or just accept it might change slightly during batch)
+	// Since we are in the same batch, using the updated EP from Phase 1 is fine.
+	currObj := idx.enterPoint
+
+	// Handle edge case: First node or self-reference
+	if currObj == -1 || currObj == idx.idMap[node.ID] {
+		return
+	}
+
+	currDist := idx.distQueryFunc(query, idx.nodes[currObj].Vec)
+
+	// 1. Greedy Search (Standard)
+	for l := idx.maxLevel; l > node.Level; l-- {
 		changed := true
 		for changed {
 			changed = false
-			for _, neighborID := range idx.nodes[currObj].Neighbors[l] {
-				dist := idx.distQueryFunc(navQuery, idx.nodes[neighborID].Vec)
+
+			// FINE-GRAINED READ LOCK
+			// We must lock the current node to safely read its neighbors
+			currNode := idx.nodes[currObj]
+			currNode.mu.RLock()
+
+			neighbors := make([]int, len(currNode.Neighbors[l]))
+			copy(neighbors, currNode.Neighbors[l])
+			currNode.mu.RUnlock()
+
+			for _, neighborID := range neighbors {
+				dist := idx.distQueryFunc(query, idx.nodes[neighborID].Vec)
 				if dist > currDist {
 					currDist = dist
 					currObj = neighborID
@@ -200,20 +284,24 @@ func (idx *HNSWIndex[T]) internalAdd(id string, vec types.Vector, meta map[strin
 		}
 	}
 
-	for l := int(math.Min(float64(level), float64(idx.maxLevel))); l >= 0; l-- {
-		idx.searchLayer(searchCtx, navQuery, currObj, idx.EfConstruction, l)
-		// candidates are in ctx.results (MinHeap, furthest at top?? No, see searchLayer)
-		// searchLayer returns nothing, it populates ctx.results.
-		// Let's adjust searchLayer to return slice or use heap directly.
-		// For efficiency, let's look at modified searchLayer below.
-		neighbors := idx.selectNeighborsFromHeap(searchCtx, searchCtx.results, idx.M)
+	// 2. Link at each level
+	for l := int(math.Min(float64(node.Level), float64(idx.maxLevel))); l >= 0; l-- {
+		// Search layer needs to be updated to use RLock internally
+		idx.searchLayerLocked(ctx, query, currObj, idx.EfConstruction, l)
 
+		neighbors := idx.selectNeighborsFromHeap(ctx, ctx.results, idx.M)
+
+		// Bi-directional Connection
+		internalID := idx.idMap[node.ID]
 		for _, neighborID := range neighbors {
-			idx.addConnection(searchCtx, l, internalID, neighborID)
-			idx.addConnection(searchCtx, l, neighborID, internalID)
+			// Link A -> B
+			idx.addConnectionLocked(ctx, l, internalID, neighborID)
+			// Link B -> A
+			idx.addConnectionLocked(ctx, l, neighborID, internalID)
 		}
-		// Update currObj to the closest found for next layer
-		if searchCtx.results.Len() > 0 {
+
+		// Update currObj for next layer...
+		if ctx.results.Len() > 0 {
 			// Accessing backing slice directly if possible, or Peek.
 			// In MinHeap (results), the TOP is the FURTHEST (worst).
 			// We need the CLOSEST. The heap stores 'ef' best candidates.
@@ -223,7 +311,7 @@ func (idx *HNSWIndex[T]) internalAdd(id string, vec types.Vector, meta map[strin
 			bestID := -1
 			bestDist := float32(-1)
 
-			for _, item := range *searchCtx.results {
+			for _, item := range *ctx.results {
 				if bestID == -1 || item.score > bestDist { // Score is similarity (higher better)
 					bestDist = item.score
 					bestID = item.id
@@ -232,12 +320,6 @@ func (idx *HNSWIndex[T]) internalAdd(id string, vec types.Vector, meta map[strin
 			currObj = bestID
 		}
 	}
-
-	if level > idx.maxLevel {
-		idx.maxLevel = level
-		idx.enterPoint = internalID
-	}
-	return nil
 }
 
 // UpdateMetadata updates only the metadata for an ID (O(1))
@@ -252,10 +334,10 @@ func (idx *HNSWIndex[T]) UpdateMetadata(id string, meta map[string]any) error {
 	return nil
 }
 
-// searchLayer performs BFS with priority queue (Beam Search)
+// searchLayerLocked performs BFS with priority queue (Beam Search) but locks nodes when reading neighbors
 // Returns list of candidates sorted by Score DESC (Closest first)
-func (idx *HNSWIndex[T]) searchLayer(ctx *searchCtx, query types.Vector, entryPoint, ef, level int) {
-	ctx.reset() // Clear heaps
+func (idx *HNSWIndex[T]) searchLayerLocked(ctx *searchCtx, query types.Vector, entryPoint, ef, level int) {
+	ctx.reset()
 
 	// 1. Manage Visited List (Thread-Local logic)
 	ctx.visitedToken++
@@ -274,10 +356,6 @@ func (idx *HNSWIndex[T]) searchLayer(ctx *searchCtx, query types.Vector, entryPo
 			grow = 1024
 		}
 		newCap := currentNodes + grow
-
-		// Create new slice (zero-initialized).
-		// NO COPY NEEDED: The logic relies on 'visitedToken'.
-		// Since new slice is all 0s, and current token > 0, checks will correctly return "not visited".
 		ctx.visitedList = make([]uint32, newCap)
 	}
 
@@ -286,7 +364,6 @@ func (idx *HNSWIndex[T]) searchLayer(ctx *searchCtx, query types.Vector, entryPo
 	// 2. Initialize Heaps
 	dist := idx.distQueryFunc(query, idx.nodes[entryPoint].Vec)
 	item := pqItem{id: entryPoint, score: dist}
-
 	heap.Push(ctx.candidates, item)
 	heap.Push(ctx.results, item)
 
@@ -299,9 +376,15 @@ func (idx *HNSWIndex[T]) searchLayer(ctx *searchCtx, query types.Vector, entryPo
 			break
 		}
 
+		// Lock node to read neighbors
+		node := idx.nodes[curr.id]
+		node.mu.RLock()
+
+		// Iterate neighbors directly inside lock is okay if callback is fast
 		for _, neighborID := range idx.nodes[curr.id].Neighbors[level] {
 			if ctx.visitedList[neighborID] != ctx.visitedToken {
 				ctx.visitedList[neighborID] = ctx.visitedToken
+
 				dist := idx.distQueryFunc(query, idx.nodes[neighborID].Vec)
 				newItem := pqItem{id: neighborID, score: dist}
 
@@ -314,12 +397,20 @@ func (idx *HNSWIndex[T]) searchLayer(ctx *searchCtx, query types.Vector, entryPo
 				}
 			}
 		}
+
+		node.mu.RUnlock()
 	}
 }
 
-// addConnection connects two nodes at a specific level, pruning if necessary
-func (idx *HNSWIndex[T]) addConnection(ctx *searchCtx, level, from, to int) {
+// addConnectionLocked connects two nodes safely
+func (idx *HNSWIndex[T]) addConnectionLocked(ctx *searchCtx, level, from, to int) {
 	node := idx.nodes[from]
+
+	// Lock write: Only lock the 'from' node
+	// This prevents deadlock because we never hold 2 node locks at the same time
+	node.mu.Lock()
+	defer node.mu.Unlock()
+
 	for _, neighbor := range node.Neighbors[level] {
 		if neighbor == to {
 			return
@@ -333,11 +424,10 @@ func (idx *HNSWIndex[T]) addConnection(ctx *searchCtx, level, from, to int) {
 	}
 
 	if len(node.Neighbors[level]) > maxM {
+		// Heuristic Pruning: Keep the best
 		fromVec := idx.nodes[from].Vec
 
-		// REUSE HEAP from context
-		// We know ctx.results is a MinHeap. We clear it first just in case.
-		// (Though internalAdd flow usually clears it after usage, safety first)
+		// Reuse Heap in context (save alloc)
 		h := ctx.results
 		*h = (*h)[:0] // Reset
 
@@ -409,7 +499,7 @@ func (idx *HNSWIndex[T]) Search(query types.Vector, k int, filter types.FilterFu
 		efSearch = k
 	}
 
-	idx.searchLayer(searchCtx, normalizedQuery, currObj, efSearch, 0)
+	idx.searchLayerLocked(searchCtx, normalizedQuery, currObj, efSearch, 0)
 
 	// Heap contents are not sorted, need to pop them
 	finalCandidates := make([]pqItem, searchCtx.results.Len())
@@ -454,30 +544,6 @@ func (idx *HNSWIndex[T]) Delete(id string) error {
 		delete(idx.Metadata, id)
 	}
 	return nil
-}
-
-func (idx *HNSWIndex[T]) Count() int {
-	idx.mu.RLock()
-	defer idx.mu.RUnlock()
-	return len(idx.idMap)
-}
-
-func (idx *HNSWIndex[T]) Dim() int {
-	idx.mu.RLock()
-	defer idx.mu.RUnlock()
-	return idx.dim
-}
-
-func (idx *HNSWIndex[T]) SetVersion(v uint64) {
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
-	idx.Version = v
-}
-
-func (idx *HNSWIndex[T]) GetVersion() uint64 {
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
-	return idx.Version
 }
 
 // Persistence
