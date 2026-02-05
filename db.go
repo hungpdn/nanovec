@@ -5,6 +5,8 @@ import (
 	"sync"
 
 	"github.com/hungpdn/nanovec/internal"
+	"github.com/hungpdn/nanovec/internal/index"
+	"github.com/hungpdn/nanovec/internal/storage"
 	"github.com/hungpdn/nanovec/pkg/types"
 )
 
@@ -24,23 +26,26 @@ type DB struct {
 
 // Open initializes the database
 func Open(cfg Config) (*DB, error) {
-	// 1. Initialize Storage (e.g., mock or BoltDB)
-	// store, err := storage.NewBoltStorage(cfg.Path)
-	// Temporarily mock to make code run
-	store := &mockStorage{data: make(map[string]*types.Document)}
-
-	// 2. Initialize Index (e.g., HNSW)
-	// idx := index.NewHNSW(cfg.Dimension)
-	// Temporarily mock
-	idx := &mockIndex{
-		vectors: make(map[string]types.Vector),
-		dim:     cfg.Dimension,
+	// 1. Initialize Storage (REAL BoltDB)
+	// Lưu file storage ngay cạnh path config, ví dụ "mydata.db.store"
+	storePath := cfg.Path + ".store"
+	store, err := storage.NewBoltStorage(storePath)
+	if err != nil {
+		return nil, err
 	}
+
+	// 2. Initialize Index (FlatIndex)
+	idx := index.NewFlatIndex(cfg.Dimension)
+
+	// Tự động Load index cũ lên RAM nếu file tồn tại
+	// (Giả sử bạn đã implement hàm Load trong FlatIndex như bài trước)
+	indexPath := cfg.Path + ".idx"
+	_ = idx.Load(indexPath) // Bỏ qua lỗi nếu file chưa tồn tại (lần chạy đầu)
 
 	return &DB{
 		config:  cfg,
 		index:   idx,
-		storage: store,
+		storage: store, // <--- Sử dụng store thật
 	}, nil
 }
 
@@ -66,7 +71,17 @@ func (db *DB) Insert(id string, vec []float32, meta map[string]interface{}) erro
 
 	// 2. Update the index in RAM
 	if err := db.index.Add(id, types.Vector(vec)); err != nil {
-		return err
+		// !!! ROLLBACK !!!
+		// Nếu thêm vào RAM lỗi, ta phải xóa ngay dữ liệu vừa ghi xuống đĩa
+		// Để đảm bảo "Một là có cả 2, Hai là không có gì"
+		fmt.Printf("Index failed, rolling back storage for ID: %s\n", id)
+
+		// Cố gắng xóa. Nếu xóa fail nốt thì... chịu (Critical Error - Cần log ra file để sysadmin xử lý)
+		if rollbackErr := db.storage.Delete(id); rollbackErr != nil {
+			return fmt.Errorf("CRITICAL: Index failed (%v) AND Rollback failed (%v)", err, rollbackErr)
+		}
+
+		return fmt.Errorf("failed to add to index, rolled back storage: %w", err)
 	}
 
 	return nil
@@ -100,42 +115,108 @@ func (db *DB) Search(query []float32, k int) ([]types.SearchResult, error) {
 	return results, nil
 }
 
-// Close closes the connection
-func (db *DB) Close() error {
-	return db.storage.Close()
-}
+// Update cập nhật document.
+// Nếu vector thay đổi, ta phải thực hiện quy trình Delete-then-Insert trên Index.
+func (db *DB) Update(id string, newVec []float32, newMeta map[string]interface{}) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
 
-// ---------------------------------------------------------
-// Mock Implementation (This is just a demo code to get it working right away)
-// ---------------------------------------------------------
+	// 1. Kiểm tra xem document có tồn tại không để lấy dữ liệu cũ
+	oldDoc, err := db.storage.Get(id)
+	if err != nil {
+		return fmt.Errorf("document not found: %s", id)
+	}
 
-type mockStorage struct {
-	data map[string]*types.Document
-}
+	// 2. Chuẩn bị dữ liệu mới (Merge dữ liệu cũ và mới)
+	finalVec := oldDoc.Vector
+	vectorChanged := false
 
-func (m *mockStorage) Put(doc *types.Document) error          { m.data[doc.ID] = doc; return nil }
-func (m *mockStorage) Get(id string) (*types.Document, error) { return m.data[id], nil }
-func (m *mockStorage) Close() error                           { return nil }
+	// Nếu user truyền vector mới vào
+	if len(newVec) > 0 {
+		if len(newVec) != db.config.Dimension {
+			return fmt.Errorf("dimension mismatch")
+		}
+		finalVec = types.Vector(newVec)
+		vectorChanged = true
+	}
 
-type mockIndex struct {
-	vectors map[string]types.Vector
-	dim     int
-}
+	// Nếu user truyền metadata mới vào
+	finalMeta := oldDoc.Metadata
+	if newMeta != nil {
+		finalMeta = newMeta
+	}
 
-func (m *mockIndex) Add(id string, vec types.Vector) error { m.vectors[id] = vec; return nil }
-func (m *mockIndex) Search(vec types.Vector, k int) ([]string, []float32, error) {
-	// Dummy implementation: Returns the first vector found.
-	// In reality, you would compute Cosine Similarity here
-	keys := make([]string, 0, k)
-	scores := make([]float32, 0, k)
-	for id := range m.vectors {
-		keys = append(keys, id)
-		scores = append(scores, 0.99) // Fake score
-		if len(keys) >= k {
-			break
+	newDoc := &types.Document{
+		ID:       id,
+		Vector:   finalVec,
+		Metadata: finalMeta,
+	}
+
+	// 3. Cập nhật Storage (BoltDB tự động ghi đè - Upsert)
+	if err := db.storage.Put(newDoc); err != nil {
+		return err
+	}
+
+	// 4. Cập nhật Index (Phần quan trọng nhất)
+	if vectorChanged {
+		// A. Xóa vector cũ khỏi Index (Bạn cần thêm hàm Delete cho Index Interface nữa)
+		if err := db.index.Delete(id); err != nil {
+			return fmt.Errorf("failed to delete old vector from index: %v", err)
+		}
+
+		// B. Thêm vector mới vào Index
+		if err := db.index.Add(id, finalVec); err != nil {
+			return fmt.Errorf("failed to add new vector to index: %v", err)
 		}
 	}
-	return keys, scores, nil
+	// Nếu chỉ sửa metadata, Index không cần làm gì cả
+
+	return nil
 }
-func (m *mockIndex) Save(path string) error { return nil }
-func (m *mockIndex) Load(path string) error { return nil }
+
+// Delete xóa document hoàn toàn khỏi database (cả trên đĩa và trong RAM)
+func (db *DB) Delete(id string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	// 0. (Chuẩn bị Rollback) Lấy dữ liệu cũ trước khi xóa
+	oldDoc, err := db.storage.Get(id)
+	if err != nil {
+		return err // Không tìm thấy trong storage thì coi như lỗi luôn
+	}
+
+	// 1. Xóa khỏi Storage (BoltDB)
+	// Việc này đảm bảo dữ liệu biến mất khỏi đĩa cứng
+	if err := db.storage.Delete(id); err != nil {
+		return fmt.Errorf("failed to delete from storage: %w", err)
+	}
+
+	// 2. Xóa khỏi Index (RAM)
+	// Việc này đảm bảo không tìm thấy vector đó nữa trong phiên làm việc hiện tại
+	if err := db.index.Delete(id); err != nil {
+		// !!! ROLLBACK !!!
+		// Index xóa không được -> Phải khôi phục lại dữ liệu trên Storage
+		fmt.Printf("Index delete failed, restoring storage for ID: %s\n", id)
+
+		if rollbackErr := db.storage.Put(oldDoc); rollbackErr != nil {
+			return fmt.Errorf("CRITICAL: Index delete failed (%v) AND Restore failed (%v)", err, rollbackErr)
+		}
+
+		return fmt.Errorf("failed to delete from index, state restored: %w", err)
+	}
+
+	return nil
+}
+
+// Close closes the connection
+// Close: Cần lưu Index xuống đĩa trước khi đóng Storage
+func (db *DB) Close() error {
+	// 1. Lưu Index (RAM -> Disk)
+	indexPath := db.config.Path + ".idx"
+	if err := db.index.Save(indexPath); err != nil {
+		return fmt.Errorf("failed to save index: %v", err)
+	}
+
+	// 2. Đóng Storage (BoltDB)
+	return db.storage.Close()
+}
