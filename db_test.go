@@ -215,3 +215,98 @@ func TestHNSWSQ8Index(t *testing.T) {
 		assertEqual(t, "vecB", results[0].ID, "Should find vecB after restart")
 	}()
 }
+
+func TestHNSWPersistence(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "hnsw_persist_test")
+
+	cfg := &nanovec.Config{
+		Dimension:      3,
+		IndexType:      nanovec.IndexTypeHNSW,
+		M:              16,
+		EfConstruction: 100,
+	}
+
+	// 1. Insert Data
+	func() {
+		db, err := nanovec.Open(dbPath, cfg)
+		assertNoError(t, err, "Open HNSW DB")
+		defer db.Close()
+
+		err = db.Insert("vecA", []float32{1, 0, 0}, map[string]any{"type": "A"})
+		assertNoError(t, err, "Insert A")
+		err = db.Insert("vecB", []float32{0, 1, 0}, map[string]any{"type": "B"})
+		assertNoError(t, err, "Insert B")
+	}()
+
+	// 2. Restart and Verify
+	func() {
+		db, err := nanovec.Open(dbPath, cfg)
+		assertNoError(t, err, "Re-Open HNSW DB")
+		defer db.Close()
+
+		// Search for B to ensure graph is navigable and data persisted
+		results, err := db.Search([]float32{0, 1, 0}, 5, nil)
+		assertNoError(t, err, "Search B after restart")
+
+		if len(results) == 0 {
+			t.Fatal("HNSW persistence failed: No results found")
+		}
+		assertEqual(t, "vecB", results[0].ID, "Should find vecB after restart")
+
+		// Ensure metadata is intact
+		if results[0].Metadata["type"] != "B" {
+			t.Errorf("Metadata mismatch: expected B, got %v", results[0].Metadata["type"])
+		}
+	}()
+}
+
+func TestDeleteConsistency(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "delete_test")
+	cfg := &nanovec.Config{Dimension: 3}
+
+	// 1. Insert and Delete
+	func() {
+		db, err := nanovec.Open(dbPath, cfg)
+		assertNoError(t, err, "Open DB")
+		defer db.Close()
+
+		// Insert
+		err = db.Insert("doc1", []float32{1, 0, 0}, nil)
+		assertNoError(t, err, "Insert doc1")
+
+		// Verify exists
+		if !db.Exists("doc1") {
+			t.Fatal("doc1 should exist")
+		}
+
+		// Delete
+		err = db.Delete("doc1")
+		assertNoError(t, err, "Delete doc1")
+
+		// Verify gone from RAM immediately
+		if db.Exists("doc1") {
+			t.Fatal("doc1 should be deleted from RAM")
+		}
+	}()
+
+	// 2. Restart and Verify (Persistence check)
+	func() {
+		db, err := nanovec.Open(dbPath, cfg)
+		assertNoError(t, err, "Re-Open DB")
+		defer db.Close()
+
+		// Verify gone from Disk/Index after restart
+		if db.Exists("doc1") {
+			t.Fatal("doc1 should remain deleted after restart (Zombie Data check)")
+		}
+
+		// Search should return empty
+		results, err := db.Search([]float32{1, 0, 0}, 5, nil)
+		assertNoError(t, err, "Search")
+		if len(results) != 0 {
+			t.Errorf("Expected 0 results for deleted item, got %d", len(results))
+		}
+	}()
+}

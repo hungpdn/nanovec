@@ -426,6 +426,9 @@ func (idx *HNSWIndex[T]) Save(path string) error {
 	defer f.Close()
 
 	enc := gob.NewEncoder(f)
+	if err := enc.Encode(idx.Version); err != nil {
+		return err
+	}
 	if err := enc.Encode(idx.dim); err != nil {
 		return err
 	}
@@ -472,6 +475,9 @@ func (idx *HNSWIndex[T]) Load(path string) error {
 	defer f.Close()
 
 	dec := gob.NewDecoder(f)
+	if err := dec.Decode(&idx.Version); err != nil {
+		return err
+	}
 	if err := dec.Decode(&idx.dim); err != nil {
 		return err
 	}
