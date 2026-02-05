@@ -9,7 +9,7 @@ func QuantizeSQ8(vec types.Vector) types.Vector8 {
 	out := make(types.Vector8, len(vec))
 	for i, v := range vec {
 		// Shift range from [-1, 1] to [0, 2] -> multiply by 127.5 -> [0, 255]
-		val := (v + 1.0) * 127.5
+		val := (v + 1.0) * Scale
 
 		// Clamp values to avoid overflow/underflow
 		if val < 0 {
@@ -18,7 +18,11 @@ func QuantizeSQ8(vec types.Vector) types.Vector8 {
 		if val > 255 {
 			val = 255
 		}
-		out[i] = uint8(val)
+
+		// Add 0.5 for nearest neighbor rounding before truncation
+		// 127.9 + 0.5 = 128.4 -> uint8(128.4) = 128 (Correct)
+		// 127.2 + 0.5 = 127.7 -> uint8(127.7) = 127 (Correct)
+		out[i] = uint8(val + 0.5)
 	}
 	return out
 }
