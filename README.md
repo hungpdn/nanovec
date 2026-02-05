@@ -1,8 +1,9 @@
 # nanovec
 
-![Go Version](https://img.shields.io/github/go-mod/go-version/hungpdn/nanovec)
+![Go Version](https://img.shields.io/badge/go-1.23-blue)
 ![Build Status](https://github.com/hungpdn/nanovec/actions/workflows/go.yml/badge.svg)
-![License](https://img.shields.io/github/license/hungpdn/nanovec)
+![License](https://img.shields.io/badge/license-MIT-green)
+[![Go Report Card](https://goreportcard.com/badge/github.com/hungpdn/nanovec)](https://goreportcard.com/report/github.com/hungpdn/nanovec)
 
 **nanovec** is an embedded, serverless vector database for Go, built with the philosophy of SQLite. It runs in-process, requires zero configuration, and persists data to a single file.
 
