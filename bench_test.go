@@ -31,7 +31,7 @@ func BenchmarkDB_Insert_Sequential(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		id := fmt.Sprintf("id_%d", i)
-		db.Insert(id, vec, nil)
+		_ = db.Insert(id, vec, nil)
 	}
 }
 
@@ -60,7 +60,7 @@ func BenchmarkDB_Insert_Batch_1000(b *testing.B) {
 		for k := 0; k < batchSize; k++ {
 			ids[k] = fmt.Sprintf("batch_%d_%d", i, k)
 		}
-		db.InsertBatch(ids, vecs, metas)
+		_ = db.InsertBatch(ids, vecs, metas)
 	}
 }
 
@@ -86,13 +86,13 @@ func BenchmarkDB_Search_HNSW(b *testing.B) {
 		ids[i] = fmt.Sprintf("id_%d", i)
 		vecs[i] = randomVector(128)
 	}
-	db.InsertBatch(ids, vecs, metas)
+	_ = db.InsertBatch(ids, vecs, metas)
 
 	query := randomVector(128)
 	b.ResetTimer()
 
 	// 2. Run Benchmark
 	for i := 0; i < b.N; i++ {
-		db.Search(query, 10, nil)
+		_, _ = db.Search(query, 10, nil)
 	}
 }

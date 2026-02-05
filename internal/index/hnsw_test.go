@@ -132,11 +132,11 @@ func TestHNSW_Concurrency(t *testing.T) {
 				vec := randomVector(dim)
 
 				// Insert
-				idx.Add(id, vec, nil)
+				_ = idx.Add(id, vec, nil)
 
 				// Intermittent search (reading while writing)
 				if j%10 == 0 {
-					idx.Search(vec, 5, nil)
+					_, _ = idx.Search(vec, 5, nil)
 				}
 			}
 		}(i)
@@ -157,11 +157,11 @@ func TestHNSW_SQ8(t *testing.T) {
 	idx := NewHNSWIndexSQ8(dim, 16, 200)
 
 	targetVec := randomVector(dim)
-	idx.Add("target", targetVec, nil)
+	_ = idx.Add("target", targetVec, nil)
 
 	// Add many vector
 	noiseVec := randomVector(dim)
-	idx.Add("noise", noiseVec, nil)
+	_ = idx.Add("noise", noiseVec, nil)
 
 	// Search exact targetVec
 	results, _ := idx.Search(targetVec, 1, nil)
@@ -238,6 +238,6 @@ func BenchmarkHNSW_Search_Float(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		idx.Search(query, 10, nil)
+		_, _ = idx.Search(query, 10, nil)
 	}
 }

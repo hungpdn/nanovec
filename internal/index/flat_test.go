@@ -17,8 +17,8 @@ func TestFlat_Float_Basic(t *testing.T) {
 	// Normalized vector (for easier dot product calculation)
 	// A = [1, 0, 0, 0]
 	// B = [0, 1, 0, 0]
-	idx.Add("A", []float32{1, 0, 0, 0}, nil)
-	idx.Add("B", []float32{0, 1, 0, 0}, nil)
+	_ = idx.Add("A", []float32{1, 0, 0, 0}, nil)
+	_ = idx.Add("B", []float32{0, 1, 0, 0}, nil)
 
 	// Search A -> should find A (Score 1.0) and B (Score 0.0)
 	results, err := idx.Search([]float32{1, 0, 0, 0}, 2, nil)
@@ -45,10 +45,10 @@ func TestFlat_SQ8_Basic(t *testing.T) {
 	// -1.0 -> 0
 
 	// Add vector A = [1, 1, 1, 1]
-	idx.Add("A", []float32{1, 1, 1, 1}, nil)
+	_ = idx.Add("A", []float32{1, 1, 1, 1}, nil)
 
 	// Add vector B = [-1, -1, -1, -1]
-	idx.Add("B", []float32{-1, -1, -1, -1}, nil)
+	_ = idx.Add("B", []float32{-1, -1, -1, -1}, nil)
 
 	// Search A
 	results, _ := idx.Search([]float32{1, 1, 1, 1}, 2, nil)
@@ -78,7 +78,7 @@ func TestFlat_BatchAndDelete(t *testing.T) {
 	}
 
 	// Batch Add
-	idx.AddBatch(ids, vecs, metas)
+	_ = idx.AddBatch(ids, vecs, metas)
 
 	if idx.Count() != 3 {
 		t.Errorf("Count mismatch. Expected 3, got %d", idx.Count())
@@ -86,7 +86,7 @@ func TestFlat_BatchAndDelete(t *testing.T) {
 
 	// Delete item "2" (in the middle of the list)
 	// Flat indexes usually use Swap-and-Pop, so item "3" will be moved to the position of "2"
-	idx.Delete("2")
+	_ = idx.Delete("2")
 
 	if idx.Count() != 2 {
 		t.Errorf("Count mismatch after delete. Expected 2, got %d", idx.Count())
@@ -121,7 +121,7 @@ func TestFlat_Persistence(t *testing.T) {
 	path := filepath.Join(tmpDir, "flat.idx")
 
 	idx1 := NewFlatIndexFloat(2)
-	idx1.Add("A", []float32{1, 0}, map[string]any{"foo": "bar"})
+	_ = idx1.Add("A", []float32{1, 0}, map[string]any{"foo": "bar"})
 
 	if err := idx1.Save(path); err != nil {
 		t.Fatal(err)
@@ -164,11 +164,11 @@ func TestFlat_Concurrency(t *testing.T) {
 				vec := randomVector(dim)
 
 				// Write
-				idx.Add(id, vec, nil)
+				_ = idx.Add(id, vec, nil)
 
 				// Concurrent Read
 				if j%10 == 0 {
-					idx.Search(vec, 5, nil)
+					_, _ = idx.Search(vec, 5, nil)
 				}
 			}
 		}(i)

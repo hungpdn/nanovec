@@ -137,7 +137,7 @@ func TestBoltStorage_SelfHealing(t *testing.T) {
 
 	// 1. Initial Insert
 	store, _ := NewBoltStorage(dbPath)
-	store.Put(&types.Document{ID: "d1", Vector: []float32{1.0}})
+	_, _ = store.Put(&types.Document{ID: "d1", Vector: []float32{1.0}})
 	store.Close()
 
 	// 2. Re-open Database

@@ -1,0 +1,41 @@
+name: Go
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.23'
+        cache: true
+
+    - name: Install dependencies
+      run: go mod download
+
+    - name: Verify dependencies
+      run: go mod verify
+
+    - name: Run Linter
+      uses: golangci/golangci-lint-action@v3
+      with:
+        version: latest
+        args: --timeout=5m
+
+    - name: Run Tests (Race Detection)
+      run: make test
+
+    - name: Build Examples
+      run: make build
+
+    # - name: Run Benchmarks (Sanity Check)
+    #   run: go test -bench=. -benchmem -run=^$ ./...

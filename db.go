@@ -147,7 +147,7 @@ func Open(path string, cfg *Config) (*DB, error) {
 		})
 
 		if len(batchIDs) > 0 {
-			if err := idx.AddBatch(batchIDs, batchVecs, batchMetas); err != nil {
+			if err = idx.AddBatch(batchIDs, batchVecs, batchMetas); err != nil {
 				return nil, fmt.Errorf("failed to flush remaining batch: %v", err)
 			}
 		}
@@ -252,7 +252,7 @@ func (db *DB) Search(query []float32, k int, filter types.FilterFunc) ([]types.S
 	}
 
 	buf := db.searchBufPool.Get().([]float32)
-	defer db.searchBufPool.Put(buf)
+	defer db.searchBufPool.Put(&buf)
 	copy(buf, query)
 	maths.NormalizeInPlace(buf)
 
@@ -391,7 +391,7 @@ func (db *DB) Vacuum() error {
 	}
 
 	if len(batchIDs) > 0 {
-		if err := newIdx.AddBatch(batchIDs, batchVecs, batchMetas); err != nil {
+		if err = newIdx.AddBatch(batchIDs, batchVecs, batchMetas); err != nil {
 			return fmt.Errorf("vacuum flush failed: %v", err)
 		}
 	}

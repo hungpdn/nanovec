@@ -211,8 +211,8 @@ func (idx *HNSWIndex[T]) AddBatch(ids []string, vecs []types.Vector, metas []map
 	normalizedVecs := make([][]float32, count)
 
 	// Local variables for Batch Global State Update
-	var batchMaxLevel int = -1
-	var batchEP int = -1
+	var batchMaxLevel = -1
+	var batchEP = -1
 
 	for i := 0; i < count; i++ {
 		start := i * idx.dim
@@ -608,30 +608,30 @@ func (idx *HNSWIndex[T]) Save(path string) error {
 	w := bufio.NewWriterSize(f, 64*types.KB)
 
 	// 1. Header Params (Write to 'w' instead of 'f')
-	if err := binary.Write(w, binary.LittleEndian, idx.Version); err != nil {
+	if err = binary.Write(w, binary.LittleEndian, idx.Version); err != nil {
 		return err
 	}
-	if err := binary.Write(w, binary.LittleEndian, int32(idx.dim)); err != nil {
+	if err = binary.Write(w, binary.LittleEndian, int32(idx.dim)); err != nil {
 		return err
 	}
-	if err := binary.Write(w, binary.LittleEndian, int32(idx.M)); err != nil {
+	if err = binary.Write(w, binary.LittleEndian, int32(idx.M)); err != nil {
 		return err
 	}
-	if err := binary.Write(w, binary.LittleEndian, int32(idx.EfConstruction)); err != nil {
+	if err = binary.Write(w, binary.LittleEndian, int32(idx.EfConstruction)); err != nil {
 		return err
 	}
-	if err := binary.Write(w, binary.LittleEndian, idx.LevelMult); err != nil {
+	if err = binary.Write(w, binary.LittleEndian, idx.LevelMult); err != nil {
 		return err
 	}
-	if err := binary.Write(w, binary.LittleEndian, int32(idx.enterPoint)); err != nil {
+	if err = binary.Write(w, binary.LittleEndian, int32(idx.enterPoint)); err != nil {
 		return err
 	}
-	if err := binary.Write(w, binary.LittleEndian, int32(idx.maxLevel)); err != nil {
+	if err = binary.Write(w, binary.LittleEndian, int32(idx.maxLevel)); err != nil {
 		return err
 	}
 
 	count := len(idx.nodes)
-	if err := binary.Write(w, binary.LittleEndian, int32(count)); err != nil {
+	if err = binary.Write(w, binary.LittleEndian, int32(count)); err != nil {
 		return err
 	}
 
@@ -640,26 +640,26 @@ func (idx *HNSWIndex[T]) Save(path string) error {
 	for _, node := range idx.nodes {
 
 		idBytes := []byte(node.ID)
-		if err := binary.Write(w, binary.LittleEndian, int32(len(idBytes))); err != nil {
+		if err = binary.Write(w, binary.LittleEndian, int32(len(idBytes))); err != nil {
 			return err
 		}
-		if _, err := w.Write(idBytes); err != nil {
+		if _, err = w.Write(idBytes); err != nil {
 			return err
 		}
-		if err := binary.Write(w, binary.LittleEndian, uint32(node.VecSum)); err != nil {
+		if err = binary.Write(w, binary.LittleEndian, uint32(node.VecSum)); err != nil {
 			return err
 		}
-		if err := binary.Write(w, binary.LittleEndian, int32(node.Level)); err != nil {
+		if err = binary.Write(w, binary.LittleEndian, int32(node.Level)); err != nil {
 			return err
 		}
 		numLayers := int32(len(node.Neighbors))
-		if err := binary.Write(w, binary.LittleEndian, numLayers); err != nil {
+		if err = binary.Write(w, binary.LittleEndian, numLayers); err != nil {
 			return err
 		}
 
 		for _, layer := range node.Neighbors {
 			layerCount := int32(len(layer))
-			if err := binary.Write(w, binary.LittleEndian, layerCount); err != nil {
+			if err = binary.Write(w, binary.LittleEndian, layerCount); err != nil {
 				return err
 			}
 
@@ -667,22 +667,22 @@ func (idx *HNSWIndex[T]) Save(path string) error {
 			for _, nID := range layer {
 				neighborBuf = append(neighborBuf, int32(nID))
 			}
-			if err := binary.Write(w, binary.LittleEndian, neighborBuf); err != nil {
+			if err = binary.Write(w, binary.LittleEndian, neighborBuf); err != nil {
 				return err
 			}
 		}
 
 		switch v := any(node.Vec).(type) {
 		case []float32:
-			if err := binary.Write(w, binary.LittleEndian, v); err != nil {
+			if err = binary.Write(w, binary.LittleEndian, v); err != nil {
 				return err
 			}
 		case []uint8:
-			if _, err := w.Write(v); err != nil {
+			if _, err = w.Write(v); err != nil {
 				return err
 			}
 		default:
-			if err := binary.Write(w, binary.LittleEndian, node.Vec); err != nil {
+			if err = binary.Write(w, binary.LittleEndian, node.Vec); err != nil {
 				return err
 			}
 		}
@@ -693,32 +693,32 @@ func (idx *HNSWIndex[T]) Save(path string) error {
 	if err != nil {
 		return err
 	}
-	if err := binary.Write(w, binary.LittleEndian, int32(len(metaBytes))); err != nil {
+	if err = binary.Write(w, binary.LittleEndian, int32(len(metaBytes))); err != nil {
 		return err
 	}
-	if _, err := w.Write(metaBytes); err != nil {
+	if _, err = w.Write(metaBytes); err != nil {
 		return err
 	}
 
 	// 4. Tombstones (Binary) to 'w'
-	if err := binary.Write(w, binary.LittleEndian, int32(idx.tombstones.Size)); err != nil {
+	if err = binary.Write(w, binary.LittleEndian, int32(idx.tombstones.Size)); err != nil {
 		return err
 	}
-	if err := binary.Write(w, binary.LittleEndian, int32(len(idx.tombstones.Data))); err != nil {
+	if err = binary.Write(w, binary.LittleEndian, int32(len(idx.tombstones.Data))); err != nil {
 		return err
 	}
-	if err := binary.Write(w, binary.LittleEndian, idx.tombstones.Data); err != nil {
-		return err
-	}
-
-	if err := w.Flush(); err != nil {
+	if err = binary.Write(w, binary.LittleEndian, idx.tombstones.Data); err != nil {
 		return err
 	}
 
-	if err := f.Sync(); err != nil {
+	if err = w.Flush(); err != nil {
 		return err
 	}
-	if err := f.Close(); err != nil {
+
+	if err = f.Sync(); err != nil {
+		return err
+	}
+	if err = f.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tmpPath, path)

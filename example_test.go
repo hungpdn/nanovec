@@ -108,8 +108,8 @@ func ExampleDB_Vacuum() {
 	defer db.Close()
 
 	// Insert and Delete
-	db.Insert("temp_item", []float32{0.5, 0.5}, nil)
-	db.Delete("temp_item")
+	_ = db.Insert("temp_item", []float32{0.5, 0.5}, nil)
+	_ = db.Delete("temp_item")
 
 	// Run Vacuum to reclaim space and rebuild index
 	// In a real application, this removes "ghost" nodes from the HNSW graph.

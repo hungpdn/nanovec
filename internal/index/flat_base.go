@@ -79,25 +79,25 @@ func (b *BaseIndex) CommitDelete(id string, pos, lastIndex int) {
 }
 
 // Dim
-func (idx *BaseIndex) Dim() int { return idx.dim }
+func (b *BaseIndex) Dim() int { return b.dim }
 
 // Count
-func (idx *BaseIndex) Count() int {
-	idx.RLock()
-	defer idx.RUnlock()
-	return len(idx.IDs)
+func (b *BaseIndex) Count() int {
+	b.RLock()
+	defer b.RUnlock()
+	return len(b.IDs)
 }
 
-func (idx *BaseIndex) SetVersion(v uint64) {
-	idx.Lock()
-	defer idx.Unlock()
-	idx.Version = v
+func (b *BaseIndex) SetVersion(v uint64) {
+	b.Lock()
+	defer b.Unlock()
+	b.Version = v
 }
 
-func (idx *BaseIndex) GetVersion() uint64 {
-	idx.Lock()
-	defer idx.Unlock()
-	return idx.Version
+func (b *BaseIndex) GetVersion() uint64 {
+	b.Lock()
+	defer b.Unlock()
+	return b.Version
 }
 
 // SaveBase: save common sections (IDs, Metadata) using BINARY + JSON (No Gob)
