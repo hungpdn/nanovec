@@ -36,11 +36,8 @@ func Open(path string, cfg *Config) (*DB, error) {
 	err = idx.Load(indexPath)
 	indexLoaded := err == nil
 
-	if indexLoaded {
-		if idx.Dim != cfg.Dimension {
-			fmt.Printf("⚠️ Config dimension (%d) matches disk index (%d). Updating config.\n", cfg.Dimension, idx.Dim)
-			cfg.Dimension = idx.Dim
-		}
+	if indexLoaded && idx.Dim != cfg.Dimension {
+		cfg.Dimension = idx.Dim
 	}
 
 	db := &DB{
@@ -52,10 +49,9 @@ func Open(path string, cfg *Config) (*DB, error) {
 
 	if !indexLoaded || idx.Count() == 0 {
 		fmt.Println("⚠️ Index missing or empty. Rebuilding from Storage...")
-
 		count := 0
 		err := db.storage.Scan(func(doc *types.Document) error {
-			if err := db.index.Add(doc.ID, doc.Vector); err != nil {
+			if err := db.index.Add(doc.ID, doc.Vector, doc.Metadata); err != nil {
 				return err
 			}
 			count++
@@ -77,7 +73,7 @@ func (db *DB) Insert(id string, vec []float32, meta map[string]interface{}) erro
 	defer db.mu.Unlock()
 
 	if len(vec) != db.config.Dimension {
-		return fmt.Errorf("vector dimension mismatch: expected %d, got %d", db.config.Dimension, len(vec))
+		return ErrDimMismatch
 	}
 
 	doc := &types.Document{
@@ -86,32 +82,31 @@ func (db *DB) Insert(id string, vec []float32, meta map[string]interface{}) erro
 		Metadata: meta,
 	}
 
-	// Write to Persistent Storage (Durability)
 	if err := db.storage.Put(doc); err != nil {
 		return fmt.Errorf("storage write failed: %v", err)
 	}
 
-	// Update Memory Index (Availability)
 	// Note: If this fails (e.g. OOM), the DB is in a "Storage-Index mismatch" state.
 	// A WAL replay on restart would fix this.
 	_ = db.index.Delete(id)
-	if err := db.index.Add(id, types.Vector(vec)); err != nil {
-		return fmt.Errorf("index update failed: %v", err)
+	if err := db.index.Add(id, types.Vector(vec), nil); err != nil {
+		return err
 	}
 
 	return nil
 }
 
 // Search finds similar vectors
-func (db *DB) Search(query []float32, k int) ([]types.SearchResult, error) {
+// filter: Optional function to check metadata. Return true to include, false to exclude.
+func (db *DB) Search(query []float32, k int, filter types.FilterFunc) ([]types.SearchResult, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
 	if len(query) != db.config.Dimension {
-		return nil, fmt.Errorf("query dimension mismatch")
+		return nil, ErrQueryDimMismatch
 	}
 
-	ids, scores, err := db.index.Search(types.Vector(query), k)
+	ids, scores, err := db.index.Search(types.Vector(query), k, filter)
 	if err != nil {
 		return nil, err
 	}
@@ -145,7 +140,7 @@ func (db *DB) Update(id string, newVec []float32, newMeta map[string]interface{}
 
 	oldDoc, err := db.storage.Get(id)
 	if err != nil {
-		return fmt.Errorf("document not found: %s", id)
+		return err
 	}
 
 	finalVec := oldDoc.Vector
@@ -167,23 +162,14 @@ func (db *DB) Update(id string, newVec []float32, newMeta map[string]interface{}
 		Metadata: finalMeta,
 	}
 
-	// Persist to Disk First
 	if err := db.storage.Put(newDoc); err != nil {
 		return err
 	}
 
-	// Update Index if Vector Changed
 	if vectorChanged {
-		// Attempt to remove old vector
-		if err := db.index.Delete(id); err != nil {
-			// Log this error in production.
-			// The storage is updated, but index might still have old vector pointing to new data.
-			return fmt.Errorf("index data inconsistency: failed to delete old vector: %v", err)
-		}
-
-		// Add new vector
-		if err := db.index.Add(id, finalVec); err != nil {
-			return fmt.Errorf("index data inconsistency: failed to add new vector: %v", err)
+		_ = db.index.Delete(id)
+		if err := db.index.Add(id, finalVec, finalMeta); err != nil {
+			return err
 		}
 	}
 

@@ -23,9 +23,10 @@ type FlatIndex struct {
 	// Map the reverse position of the ID
 	// IDs[0] correspond to the starting vector at RawVectors[0]
 	// IDs[1] correspond to the starting vector at RawVectors[dim]
-	IDs   []string
-	idMap map[string]int
-	Dim   int
+	IDs      []string
+	idMap    map[string]int
+	Metadata map[string]map[string]interface{}
+	Dim      int
 }
 
 func NewFlatIndex(dim int) *FlatIndex {
@@ -33,11 +34,12 @@ func NewFlatIndex(dim int) *FlatIndex {
 		RawVectors: make([]float32, 0),
 		IDs:        make([]string, 0),
 		idMap:      make(map[string]int),
+		Metadata:   make(map[string]map[string]interface{}),
 		Dim:        dim,
 	}
 }
 
-func (idx *FlatIndex) Add(id string, vec types.Vector) error {
+func (idx *FlatIndex) Add(id string, vec types.Vector, meta map[string]interface{}) error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
@@ -55,6 +57,7 @@ func (idx *FlatIndex) Add(id string, vec types.Vector) error {
 
 	idx.IDs = append(idx.IDs, id)
 	idx.idMap[id] = len(idx.IDs) - 1
+	idx.Metadata[id] = meta
 
 	return nil
 }
@@ -69,7 +72,6 @@ func (idx *FlatIndex) Delete(id string) error {
 		return nil
 	}
 
-	// Swap-and-Pop
 	lastIndex := len(idx.IDs) - 1
 	if pos < lastIndex {
 		lastID := idx.IDs[lastIndex]
@@ -82,13 +84,14 @@ func (idx *FlatIndex) Delete(id string) error {
 	}
 
 	delete(idx.idMap, id)
+	delete(idx.Metadata, id)
 	idx.IDs = idx.IDs[:lastIndex]
 	idx.RawVectors = idx.RawVectors[:lastIndex*idx.Dim]
 
 	return nil
 }
 
-func (idx *FlatIndex) Search(query types.Vector, k int) ([]string, []float32, error) {
+func (idx *FlatIndex) Search(query types.Vector, k int, filter types.FilterFunc) ([]string, []float32, error) {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
@@ -100,18 +103,24 @@ func (idx *FlatIndex) Search(query types.Vector, k int) ([]string, []float32, er
 	h := &ResultHeap{}
 	heap.Init(h)
 
-	// Sequential loops on seamless memory
-	// CPU Prefetcher will work extremely well here
 	for i := 0; i < n; i++ {
 		id := idx.IDs[i]
-		start := i * idx.Dim
-		end := start + idx.Dim
+
+		if filter != nil {
+			if meta, ok := idx.Metadata[id]; ok {
+				if !filter(meta) {
+					continue
+				}
+			} else {
+				continue
+			}
+		}
 
 		// Slice bounds check is eliminated by compiler here due to simple ranges
+		start := i * idx.Dim
+		end := start + idx.Dim
 		targetVec := idx.RawVectors[start:end]
-
-		// TODO: call SIMD
-		score := maths.DotProduct(query, targetVec)
+		score := maths.DotProduct(query, targetVec) // TODO: call SIMD
 
 		if h.Len() < k {
 			heap.Push(h, Item{ID: id, Score: score})
@@ -162,6 +171,9 @@ func (idx *FlatIndex) Save(path string) error {
 	if err := enc.Encode(idx.IDs); err != nil {
 		return err
 	}
+	if err := enc.Encode(idx.Metadata); err != nil {
+		return err
+	}
 	if err := binary.Write(f, binary.LittleEndian, idx.RawVectors); err != nil {
 		return err
 	}
@@ -189,6 +201,11 @@ func (idx *FlatIndex) Load(path string) error {
 
 	dec := gob.NewDecoder(f)
 	if err := dec.Decode(&idx.IDs); err != nil {
+		return err
+	}
+
+	idx.Metadata = make(map[string]map[string]interface{})
+	if err := dec.Decode(&idx.Metadata); err != nil {
 		return err
 	}
 

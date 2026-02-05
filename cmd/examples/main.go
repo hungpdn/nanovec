@@ -41,7 +41,7 @@ func main() {
 	fmt.Println("-> Inserted doc1 and doc2")
 
 	fmt.Println("\n--- 3. Searching (Before Update) ---")
-	results, err := db.Search([]float32{0.1, 0.2, 0.35}, 2)
+	results, err := db.Search([]float32{0.1, 0.2, 0.35}, 2, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -65,7 +65,7 @@ func main() {
 	fmt.Println("-> Updated doc1 successfully")
 
 	fmt.Println("\n--- 5. Searching (After Update) ---")
-	results, err = db.Search([]float32{0.1, 0.2, 0.35}, 1)
+	results, err = db.Search([]float32{0.1, 0.2, 0.35}, 1, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -79,7 +79,7 @@ func main() {
 	fmt.Println("-> Deleted doc1")
 
 	fmt.Println("\n--- 7. Searching (After Delete) ---")
-	results, err = db.Search([]float32{0.1, 0.2, 0.35}, 5)
+	results, err = db.Search([]float32{0.1, 0.2, 0.35}, 5, nil)
 	if err != nil {
 		log.Fatal(err)
 	}

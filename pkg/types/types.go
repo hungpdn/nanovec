@@ -16,3 +16,5 @@ type SearchResult struct {
 	Score    float32 `json:"score"` // Similarity score
 	Metadata map[string]interface{}
 }
+
+type FilterFunc func(metadata map[string]interface{}) bool

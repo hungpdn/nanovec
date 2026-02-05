@@ -4,9 +4,9 @@ import "github.com/hungpdn/nanovec/pkg/types"
 
 // VectorIndex: Interface for search algorithms (HNSW, Flat...)
 type VectorIndex interface {
-	Add(id string, vec types.Vector) error
+	Add(id string, vec types.Vector, meta map[string]interface{}) error
 	Delete(id string) error
-	Search(vec types.Vector, k int) ([]string, []float32, error)
+	Search(vec types.Vector, k int, filter types.FilterFunc) ([]string, []float32, error)
 	Save(path string) error
 	Load(path string) error
 }
