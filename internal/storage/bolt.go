@@ -1,7 +1,8 @@
 package storage
 
 import (
-	"encoding/json"
+	"bytes"
+	"encoding/gob"
 	"fmt"
 	"time"
 
@@ -11,21 +12,18 @@ import (
 
 const bucketName = "documents"
 
-// BoltStorage implement interface Storage dùng BoltDB
+// BoltStorage implement interface Storage use bbolt
 type BoltStorage struct {
 	db *bbolt.DB
 }
 
-// NewBoltStorage khởi tạo kết nối tới file database
+// NewBoltStorage opens the database and creates the bucket if not exists
 func NewBoltStorage(path string) (*BoltStorage, error) {
-	// Mở file db (nếu chưa có sẽ tự tạo)
-	// Timeout 1s để tránh treo nếu file đang bị khóa bởi process khác
 	db, err := bbolt.Open(path, 0600, &bbolt.Options{Timeout: 1 * time.Second})
 	if err != nil {
 		return nil, fmt.Errorf("could not open bolt db: %v", err)
 	}
 
-	// Tạo bucket (giống như Table trong SQL) nếu chưa tồn tại
 	err = db.Update(func(tx *bbolt.Tx) error {
 		_, err := tx.CreateBucketIfNotExists([]byte(bucketName))
 		return err
@@ -37,23 +35,22 @@ func NewBoltStorage(path string) (*BoltStorage, error) {
 	return &BoltStorage{db: db}, nil
 }
 
-// Put lưu document xuống đĩa (Upsert)
+// Put saves document to disk (Upsert)
 func (s *BoltStorage) Put(doc *types.Document) error {
 	return s.db.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket([]byte(bucketName))
 
-		// Serialize struct thành JSON để lưu (có thể dùng Gob nếu muốn nhanh hơn)
-		data, err := json.Marshal(doc)
-		if err != nil {
-			return err
+		var buf bytes.Buffer
+		enc := gob.NewEncoder(&buf)
+		if err := enc.Encode(doc); err != nil {
+			return fmt.Errorf("failed to encode document: %w", err)
 		}
 
-		// Key là ID, Value là JSON
-		return b.Put([]byte(doc.ID), data)
+		return b.Put([]byte(doc.ID), buf.Bytes())
 	})
 }
 
-// Get đọc document từ đĩa
+// Get read document from disk
 func (s *BoltStorage) Get(id string) (*types.Document, error) {
 	var doc types.Document
 
@@ -65,7 +62,12 @@ func (s *BoltStorage) Get(id string) (*types.Document, error) {
 			return fmt.Errorf("document not found: %s", id)
 		}
 
-		return json.Unmarshal(data, &doc)
+		buf := bytes.NewBuffer(data)
+		dec := gob.NewDecoder(buf)
+		if err := dec.Decode(&doc); err != nil {
+			return fmt.Errorf("failed to decode document: %w", err)
+		}
+		return nil
 	})
 
 	if err != nil {
@@ -75,7 +77,7 @@ func (s *BoltStorage) Get(id string) (*types.Document, error) {
 	return &doc, nil
 }
 
-// Thêm vào internal/storage/bolt.go
+// Delete remove document
 func (s *BoltStorage) Delete(id string) error {
 	return s.db.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket([]byte(bucketName))
@@ -83,7 +85,45 @@ func (s *BoltStorage) Delete(id string) error {
 	})
 }
 
-// Close đóng kết nối
+// Scan iterates over all documents and executes fn for each.
+func (s *BoltStorage) Scan(fn func(doc *types.Document) error) error {
+	return s.db.View(func(tx *bbolt.Tx) error {
+		b := tx.Bucket([]byte(bucketName))
+		c := b.Cursor()
+
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			var doc types.Document
+			buf := bytes.NewBuffer(v)
+			dec := gob.NewDecoder(buf)
+			if err := dec.Decode(&doc); err != nil {
+				return fmt.Errorf("corrupt data for id %s: %v", k, err)
+			}
+
+			if err := fn(&doc); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// Has checks if a document exists without deserializing it.
+func (s *BoltStorage) Has(id string) bool {
+	var found bool
+	_ = s.db.View(func(tx *bbolt.Tx) error {
+		b := tx.Bucket([]byte(bucketName))
+		if b == nil {
+			return nil
+		}
+		if v := b.Get([]byte(id)); v != nil {
+			found = true
+		}
+		return nil
+	})
+	return found
+}
+
+// Close closes the database connection
 func (s *BoltStorage) Close() error {
 	return s.db.Close()
 }

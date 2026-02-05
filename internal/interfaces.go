@@ -6,15 +6,17 @@ import "github.com/hungpdn/nanovec/pkg/types"
 type VectorIndex interface {
 	Add(id string, vec types.Vector) error
 	Delete(id string) error
-	Search(vec types.Vector, k int) ([]string, []float32, error) // Returns List ID and Score
+	Search(vec types.Vector, k int) ([]string, []float32, error)
 	Save(path string) error
 	Load(path string) error
 }
 
 // Storage: Interface for persistent storage
 type Storage interface {
-	Put(doc *types.Document) error // Upsert (Thêm hoặc Ghi đè)
+	Put(doc *types.Document) error // Upsert
 	Get(id string) (*types.Document, error)
-	Delete(id string) error // <--- Cần thêm cái này
+	Delete(id string) error
+	Scan(fn func(doc *types.Document) error) error
+	Has(id string) bool
 	Close() error
 }
