@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/hungpdn/nanovec/pkg/types"
@@ -113,41 +114,41 @@ func TestHNSW_Persistence(t *testing.T) {
 }
 
 // 3. Concurrency (Stress Test)
-// func TestHNSW_Concurrency(t *testing.T) {
-// 	dim := 32
-// 	idx := NewHNSWIndexFloat(dim, 16, 200)
+func TestHNSW_Concurrency(t *testing.T) {
+	dim := 32
+	idx := NewHNSWIndexFloat(dim, 16, 200)
 
-// 	var wg sync.WaitGroup
-// 	workers := 10
-// 	itemsPerWorker := 100
+	var wg sync.WaitGroup
+	workers := 10
+	itemsPerWorker := 100
 
-// 	// Run many goroutine Insert và Search concurrency
-// 	for i := 0; i < workers; i++ {
-// 		wg.Add(1)
-// 		go func(workerID int) {
-// 			defer wg.Done()
-// 			for j := 0; j < itemsPerWorker; j++ {
-// 				id := fmt.Sprintf("w%d_i%d", workerID, j)
-// 				vec := randomVector(dim)
+	// Run many goroutine Insert và Search concurrency
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for j := 0; j < itemsPerWorker; j++ {
+				id := fmt.Sprintf("w%d_i%d", workerID, j)
+				vec := randomVector(dim)
 
-// 				// Insert
-// 				_ = idx.Add(id, vec, nil)
+				// Insert
+				_ = idx.Add(id, vec, nil)
 
-// 				// Intermittent search (reading while writing)
-// 				if j%10 == 0 {
-// 					_, _ = idx.Search(vec, 5, nil)
-// 				}
-// 			}
-// 		}(i)
-// 	}
+				// Intermittent search (reading while writing)
+				if j%10 == 0 {
+					_, _ = idx.Search(vec, 5, nil)
+				}
+			}
+		}(i)
+	}
 
-// 	wg.Wait()
+	wg.Wait()
 
-// 	expectedTotal := workers * itemsPerWorker
-// 	if idx.Count() != expectedTotal {
-// 		t.Errorf("Concurrent insert lost data. Expected %d, got %d", expectedTotal, idx.Count())
-// 	}
-// }
+	expectedTotal := workers * itemsPerWorker
+	if idx.Count() != expectedTotal {
+		t.Errorf("Concurrent insert lost data. Expected %d, got %d", expectedTotal, idx.Count())
+	}
+}
 
 // 4. SQ8 (Quantization)
 func TestHNSW_SQ8(t *testing.T) {

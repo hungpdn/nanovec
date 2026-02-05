@@ -1,7 +1,7 @@
 .PHONY: all build test clean bench fmt lint
 
 # Default target
-all: fmt test build
+all: fmt test build bench lint clean
 
 # Build the example binaries
 build:

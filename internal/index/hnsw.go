@@ -50,6 +50,8 @@ type HNSWIndex[T types.Number] struct {
 	distQueryFunc func(query []float32, node []T) float32
 	// distNodeFunc calculates distance between two nodes (T and T)
 	distNodeFunc func(a, b *Node[T]) float32
+	// distQuantizedFunc calculates distance between quantized query and node (SQ8 only)
+	distQuantizedFunc func(query []uint8, node []uint8, qSum, nSum uint32) float32
 }
 
 // Node represents a point in the graph
@@ -110,6 +112,9 @@ func NewHNSWIndexSQ8(dim, m, efConstruction int) *HNSWIndex[uint8] {
 		distQueryFunc: maths.DotProductSQ8,
 		distNodeFunc: func(a, b *Node[uint8]) float32 {
 			return maths.DotProductUint8Precomputed(a.Vec, b.Vec, a.VecSum, b.VecSum)
+		},
+		distQuantizedFunc: func(q, n []uint8, qSum, nSum uint32) float32 {
+			return maths.DotProductUint8Precomputed(q, n, qSum, nSum)
 		},
 		searchCtxPool: &sync.Pool{New: func() any { return newSearchCtx(m * 2) }},
 	}
@@ -518,18 +523,46 @@ func (idx *HNSWIndex[T]) Search(query types.Vector, k int, filter types.FilterFu
 
 	normalizedQuery := query
 
+	var q8 []uint8
+	var qSum uint32
+	useQuantizedSearch := false
+
+	if idx.distQuantizedFunc != nil {
+		q8 = maths.QuantizeSQ8(query)
+		qSum = maths.CalculateVecSum(q8)
+		useQuantizedSearch = true
+	}
+
+	distFunc := func(nodeIdx int) float32 {
+		node := idx.nodes[nodeIdx]
+		if useQuantizedSearch {
+			n := any(node.Vec).([]uint8)
+			return idx.distQuantizedFunc(q8, n, qSum, node.VecSum)
+		}
+		return idx.distQueryFunc(normalizedQuery, node.Vec)
+	}
+
 	searchCtx := idx.searchCtxPool.Get().(*searchCtx)
 	defer idx.searchCtxPool.Put(searchCtx)
 
 	currObj := idx.enterPoint
-	currDist := idx.distQueryFunc(normalizedQuery, idx.nodes[currObj].Vec)
+	currDist := distFunc(currObj)
 
 	for l := idx.maxLevel; l > 0; l-- {
 		changed := true
 		for changed {
 			changed = false
-			for _, neighborID := range idx.nodes[currObj].Neighbors[l] {
-				dist := idx.distQueryFunc(normalizedQuery, idx.nodes[neighborID].Vec)
+
+			// We must RLock the node to safely read its Neighbors slice,
+			// because Add() might be modifying it concurrently.
+			currNode := idx.nodes[currObj]
+			currNode.mu.RLock()
+			neighbors := make([]int, len(currNode.Neighbors[l]))
+			copy(neighbors, currNode.Neighbors[l])
+			currNode.mu.RUnlock()
+
+			for _, neighborID := range neighbors {
+				dist := distFunc(neighborID)
 				if dist > currDist {
 					currDist = dist
 					currObj = neighborID

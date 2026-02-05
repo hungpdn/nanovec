@@ -172,7 +172,8 @@ final:
 		storage: store,
 		searchBufPool: &sync.Pool{
 			New: func() any {
-				return make([]float32, cfg.Dimension)
+				s := make([]float32, cfg.Dimension)
+				return &s
 			},
 		},
 	}, nil
@@ -251,8 +252,9 @@ func (db *DB) Search(query []float32, k int, filter types.FilterFunc) ([]types.S
 		return nil, errors.ErrQueryDimMismatch
 	}
 
-	buf := db.searchBufPool.Get().([]float32)
-	defer db.searchBufPool.Put(&buf)
+	bufPtr := db.searchBufPool.Get().(*[]float32)
+	defer db.searchBufPool.Put(bufPtr)
+	buf := *bufPtr
 	copy(buf, query)
 	maths.NormalizeInPlace(buf)
 
