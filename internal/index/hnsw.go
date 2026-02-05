@@ -485,12 +485,7 @@ func (idx *HNSWIndex[T]) GetVersion() uint64 {
 // but for simplicity in generics, we can export fields on Node[T] and use it directly.
 // In the code above, Node[T] fields are Exported.
 
-type nodeHeader struct {
-	ID        string
-	Level     int
-	Neighbors [][]int
-}
-
+// Save
 func (idx *HNSWIndex[T]) Save(path string) error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
@@ -530,14 +525,45 @@ func (idx *HNSWIndex[T]) Save(path string) error {
 		return err
 	}
 
+	// Save Nodes
+	// ID: [Len (4b)] [Bytes...]
+	// Level: [Level (4b)]
+	// Neighbors: [NumLayers (4b)] -> Loop: [LayerCount (4b)] -> [NeighborIDs... (4b each)]
+	// Vector: [Binary Data]
+	neighborBuf := make([]int32, 0, idx.MMax0)
 	for _, node := range idx.nodes {
-		header := nodeHeader{
-			ID:        node.ID,
-			Level:     node.Level,
-			Neighbors: node.Neighbors,
-		}
-		if err := enc.Encode(header); err != nil {
+
+		idBytes := []byte(node.ID)
+		if err := binary.Write(f, binary.LittleEndian, int32(len(idBytes))); err != nil {
 			return err
+		}
+		if _, err := f.Write(idBytes); err != nil {
+			return err
+		}
+
+		if err := binary.Write(f, binary.LittleEndian, int32(node.Level)); err != nil {
+			return err
+		}
+
+		numLayers := int32(len(node.Neighbors))
+		if err := binary.Write(f, binary.LittleEndian, numLayers); err != nil {
+			return err
+		}
+
+		for _, layer := range node.Neighbors {
+			layerCount := int32(len(layer))
+			if err := binary.Write(f, binary.LittleEndian, layerCount); err != nil {
+				return err
+			}
+
+			neighborBuf = neighborBuf[:0]
+			for _, nID := range layer {
+				neighborBuf = append(neighborBuf, int32(nID))
+			}
+
+			if err := binary.Write(f, binary.LittleEndian, neighborBuf); err != nil {
+				return err
+			}
 		}
 
 		if err := binary.Write(f, binary.LittleEndian, node.Vec); err != nil {
@@ -585,7 +611,6 @@ func (idx *HNSWIndex[T]) Load(path string) error {
 	if err := dec.Decode(&idx.LevelMult); err != nil {
 		return err
 	}
-
 	if err := dec.Decode(&idx.enterPoint); err != nil {
 		return err
 	}
@@ -602,9 +627,45 @@ func (idx *HNSWIndex[T]) Load(path string) error {
 	idx.idMap = make(map[string]int)
 
 	for i := 0; i < count; i++ {
-		var header nodeHeader
-		if err := dec.Decode(&header); err != nil {
+		var idLen int32
+		if err := binary.Read(f, binary.LittleEndian, &idLen); err != nil {
 			return err
+		}
+
+		idBytes := make([]byte, idLen)
+		if _, err := f.Read(idBytes); err != nil {
+			return err
+		}
+		id := string(idBytes)
+
+		var level int32
+		if err := binary.Read(f, binary.LittleEndian, &level); err != nil {
+			return err
+		}
+
+		var numLayers int32
+		if err := binary.Read(f, binary.LittleEndian, &numLayers); err != nil {
+			return err
+		}
+
+		neighbors := make([][]int, numLayers)
+		for l := 0; l < int(numLayers); l++ {
+			var layerCount int32
+			if err := binary.Read(f, binary.LittleEndian, &layerCount); err != nil {
+				return err
+			}
+
+			layerInt32 := make([]int32, layerCount)
+			if err := binary.Read(f, binary.LittleEndian, &layerInt32); err != nil {
+				return err
+			}
+
+			// Convert back to int
+			layer := make([]int, layerCount)
+			for k, v := range layerInt32 {
+				layer[k] = int(v)
+			}
+			neighbors[l] = layer
 		}
 
 		vec := make([]T, idx.dim)
@@ -613,10 +674,10 @@ func (idx *HNSWIndex[T]) Load(path string) error {
 		}
 
 		node := &Node[T]{
-			ID:        header.ID,
+			ID:        id,
 			Vec:       vec,
-			Level:     header.Level,
-			Neighbors: header.Neighbors,
+			Level:     int(level),
+			Neighbors: neighbors,
 		}
 		idx.nodes[i] = node
 		idx.idMap[node.ID] = i
