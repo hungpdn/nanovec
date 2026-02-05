@@ -1,10 +1,12 @@
 package storage
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/hungpdn/nanovec/pkg/types"
@@ -16,6 +18,7 @@ const (
 	bucketMeta      = "metadata"
 	keyDocCount     = "doc_count"
 	keyDbVersion    = "db_version"
+	MaxAllowedDim   = 32768 // Limit dimensions to avoid OOM/Corruption
 )
 
 // BoltStorage implement interface Storage use bbolt
@@ -44,84 +47,25 @@ func NewBoltStorage(path string) (*BoltStorage, error) {
 		return nil, err
 	}
 
-	return &BoltStorage{db: db}, nil
+	s := &BoltStorage{db: db}
+	_ = s.SyncDocCount() // Auto-repair counter on startup
+	return s, nil
 }
 
-// --- High Performance Serialization Helpers ---
+// SyncDocCount ensures the O(1) counter matches the actual B+Tree key count
+func (s *BoltStorage) SyncDocCount() error {
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		bDocs := tx.Bucket([]byte(bucketDocuments))
+		bMeta := tx.Bucket([]byte(bucketMeta))
 
-// serializeDocument encodes document to binary format efficiently
-// Format: [Dim(4b)][Vector(dim*4b)][JsonMetadata(...)]
-func serializeDocument(doc *types.Document) ([]byte, error) {
-	dim := len(doc.Vector)
-	vecSize := 4 + dim*4 // 4 bytes for header + data
+		// Use Bolt's internal bucket stats for high performance counting
+		count := uint64(bDocs.Stats().KeyN)
 
-	// 1. Pre-allocate buffer for Vector Part
-	buf := make([]byte, vecSize)
-
-	// 2. Write Dimension
-	binary.LittleEndian.PutUint32(buf[0:4], uint32(dim))
-
-	// 3. Write Vector Data (Fast Loop, No Reflection)
-	offset := 4
-	for _, v := range doc.Vector {
-		bits := math.Float32bits(v)
-		binary.LittleEndian.PutUint32(buf[offset:offset+4], bits)
-		offset += 4
-	}
-
-	// 4. Encode Metadata (Use JSON for compatibility & safety)
-	if len(doc.Metadata) > 0 {
-		metaBytes, err := json.Marshal(doc.Metadata)
-		if err != nil {
-			return nil, fmt.Errorf("metadata encode failed: %w", err)
-		}
-		buf = append(buf, metaBytes...)
-	}
-	return buf, nil
+		buf := make([]byte, 8)
+		binary.LittleEndian.PutUint64(buf, count)
+		return bMeta.Put([]byte(keyDocCount), buf)
+	})
 }
-
-// deserializeDocument decodes binary data back to Document
-func deserializeDocument(id string, data []byte) (*types.Document, error) {
-	if len(data) < 4 {
-		return nil, fmt.Errorf("data too short")
-	}
-
-	// 1. Read Dimension
-	dim := int(binary.LittleEndian.Uint32(data[0:4]))
-
-	// Safety check
-	expectedVecSize := 4 + dim*4
-	if len(data) < expectedVecSize {
-		return nil, fmt.Errorf("data corrupted or truncated")
-	}
-
-	// 2. Read Vector
-	vec := make(types.Vector, dim)
-	offset := 4
-	for i := 0; i < dim; i++ {
-		bits := binary.LittleEndian.Uint32(data[offset : offset+4])
-		vec[i] = math.Float32frombits(bits)
-		offset += 4
-	}
-
-	// 3. Read Metadata (if any bytes left)
-	var meta map[string]any
-	if len(data) > expectedVecSize {
-		// Just unmarshal the rest of the slice
-		// Note: Numbers will be unmarshaled as float64 by default in JSON
-		if err := json.Unmarshal(data[expectedVecSize:], &meta); err != nil {
-			return nil, fmt.Errorf("metadata decode failed: %w", err)
-		}
-	}
-
-	return &types.Document{
-		ID:       id, // ID comes from the BoltDB Key
-		Vector:   vec,
-		Metadata: meta,
-	}, nil
-}
-
-// --- Storage Implementation ---
 
 func (s *BoltStorage) GetVersion() (uint64, error) {
 	var ver uint64
@@ -145,28 +89,31 @@ func (s *BoltStorage) incVersion(tx *bbolt.Tx) (uint64, error) {
 	return seq, b.Put([]byte(keyDbVersion), buf)
 }
 
-// Put saves document to disk (Upsert) AND returns the new Version
+// Put saves document to disk (Upsert) and returns the new Version
 func (s *BoltStorage) Put(doc *types.Document) (uint64, error) {
 	var newSeq uint64
 	err := s.db.Update(func(tx *bbolt.Tx) error {
 		bDocs := tx.Bucket([]byte(bucketDocuments))
 		bMeta := tx.Bucket([]byte(bucketMeta))
 
-		if bDocs.Get([]byte(doc.ID)) == nil {
-			if err := s.incrementCount(bMeta, 1); err != nil {
-				return err
-			}
-		}
+		buf := bufferPool.Get().(*bytes.Buffer)
+		buf.Reset()
+		defer bufferPool.Put(buf)
 
-		data, err := serializeDocument(doc)
-		if err != nil {
+		if err := serializeDocument(doc, buf); err != nil {
 			return err
 		}
 
-		if err := bDocs.Put([]byte(doc.ID), data); err != nil {
+		if err := bDocs.Put([]byte(doc.ID), buf.Bytes()); err != nil {
 			return err
 		}
 
+		count := uint64(bDocs.Stats().KeyN)
+		countBuf := make([]byte, 8)
+		binary.LittleEndian.PutUint64(countBuf, count)
+		_ = bMeta.Put([]byte(keyDocCount), countBuf)
+
+		var err error
 		newSeq, err = s.incVersion(tx)
 		return err
 	})
@@ -174,48 +121,50 @@ func (s *BoltStorage) Put(doc *types.Document) (uint64, error) {
 	return newSeq, err
 }
 
-// PutBatch saves multiple documents AND returns the new Version
+// PutBatch saves multiple documents and returns the new Version
 func (s *BoltStorage) PutBatch(docs []*types.Document) (uint64, error) {
-	// 1. PRE-SERIALIZATION (Outside Lock) -> CPU bound
-	docData := make([][]byte, len(docs))
+	type docRange struct {
+		id    []byte
+		start int
+		end   int
+	}
+	ranges := make([]docRange, len(docs))
+
+	// Get a large buffer from pool to act as our "Arena"
+	batchBuf := bufferPool.Get().(*bytes.Buffer)
+	batchBuf.Reset()
+	defer bufferPool.Put(batchBuf)
+	// Pre-serialize outside the transaction to keep DB lock short
 	for i, doc := range docs {
-		data, err := serializeDocument(doc)
-		if err != nil {
+		start := batchBuf.Len()
+		if err := serializeDocument(doc, batchBuf); err != nil {
 			return 0, err
 		}
-		docData[i] = data
+		ranges[i] = docRange{
+			id:    []byte(doc.ID),
+			start: start,
+			end:   batchBuf.Len(),
+		}
 	}
 
 	var newSeq uint64
-	// 2. WRITE TRANSACTION (Inside Lock) -> IO bound
 	err := s.db.Update(func(tx *bbolt.Tx) error {
 		bDocs := tx.Bucket([]byte(bucketDocuments))
 		bMeta := tx.Bucket([]byte(bucketMeta))
 
-		var newItems uint64
-		// Track IDs seen in this batch to prevent double-counting.
-		// Even if the input slice has ["A", "A"], we only count "A" as new once.
-		visited := make(map[string]bool, len(docs))
+		allData := batchBuf.Bytes()
 
-		for i, doc := range docs {
-			// Only check for "newness" if we haven't processed this ID in this batch yet.
-			// (Last Write Wins logic still applies for the Put itself, but we shouldn't increment count twice)
-			if !visited[doc.ID] {
-				if bDocs.Get([]byte(doc.ID)) == nil {
-					newItems++
-				}
-				visited[doc.ID] = true
-			}
-
-			if err := bDocs.Put([]byte(doc.ID), docData[i]); err != nil {
+		for _, r := range ranges {
+			if err := bDocs.Put(r.id, allData[r.start:r.end]); err != nil {
 				return err
 			}
 		}
 
-		if newItems > 0 {
-			if err := s.incrementCount(bMeta, newItems); err != nil {
-				return err
-			}
+		count := uint64(bDocs.Stats().KeyN)
+		countBuf := make([]byte, 8)
+		binary.LittleEndian.PutUint64(countBuf, count)
+		if err := bMeta.Put([]byte(keyDocCount), countBuf); err != nil {
+			return err
 		}
 
 		var err error
@@ -254,31 +203,35 @@ func (s *BoltStorage) Get(id string) (*types.Document, error) {
 
 // Delete remove document
 func (s *BoltStorage) Delete(id string) (uint64, error) {
-	var newSeq uint64
+	var currentSeq uint64
 	err := s.db.Update(func(tx *bbolt.Tx) error {
 		bDocs := tx.Bucket([]byte(bucketDocuments))
 		bMeta := tx.Bucket([]byte(bucketMeta))
 
-		if bDocs.Get([]byte(id)) == nil {
-			val := bMeta.Get([]byte(keyDbVersion))
-			if val != nil {
-				newSeq = binary.LittleEndian.Uint64(val)
+		idBytes := []byte(id)
+		if bDocs.Get(idBytes) == nil {
+			v := bMeta.Get([]byte(keyDbVersion))
+			if v != nil {
+				currentSeq = binary.LittleEndian.Uint64(v)
 			}
 			return nil
 		}
 
-		if err := s.decrementCount(bMeta, 1); err != nil {
-			return err
-		}
 		if err := bDocs.Delete([]byte(id)); err != nil {
 			return err
 		}
+
+		count := uint64(bDocs.Stats().KeyN)
+		countBuf := make([]byte, 8)
+		binary.LittleEndian.PutUint64(countBuf, count)
+		_ = bMeta.Put([]byte(keyDocCount), countBuf)
+
 		var err error
-		newSeq, err = s.incVersion(tx)
+		currentSeq, err = s.incVersion(tx)
 		return err
 	})
 
-	return newSeq, err
+	return currentSeq, err
 }
 
 // Scan iterates over all documents
@@ -335,35 +288,76 @@ func (s *BoltStorage) Count() (int, error) {
 	return count, err
 }
 
-// Helpers for counter
-func (s *BoltStorage) incrementCount(b *bbolt.Bucket, delta uint64) error {
-	val := b.Get([]byte(keyDocCount))
-	var count uint64
-	if val != nil {
-		count = binary.LittleEndian.Uint64(val)
-	}
-	count += delta
-	buf := make([]byte, 8)
-	binary.LittleEndian.PutUint64(buf, count)
-	return b.Put([]byte(keyDocCount), buf)
-}
-
-func (s *BoltStorage) decrementCount(b *bbolt.Bucket, delta uint64) error {
-	val := b.Get([]byte(keyDocCount))
-	var count uint64
-	if val != nil {
-		count = binary.LittleEndian.Uint64(val)
-	}
-	if delta > count {
-		count = 0
-	} else {
-		count -= delta
-	}
-	buf := make([]byte, 8)
-	binary.LittleEndian.PutUint64(buf, count)
-	return b.Put([]byte(keyDocCount), buf)
-}
-
 func (s *BoltStorage) Close() error {
 	return s.db.Close()
+}
+
+var bufferPool = sync.Pool{
+	New: func() any {
+		return new(bytes.Buffer)
+	},
+}
+
+// serializeDocument encodes document to binary format efficiently
+// Format: [Dim(4b)][Vector(dim*4b)][JsonMetadata(...)]
+func serializeDocument(doc *types.Document, buf *bytes.Buffer) error {
+	dim := len(doc.Vector)
+	var scratch [4]byte
+
+	binary.LittleEndian.PutUint32(scratch[:], uint32(dim))
+	buf.Write(scratch[:])
+
+	for _, v := range doc.Vector {
+		bits := math.Float32bits(v)
+		binary.LittleEndian.PutUint32(scratch[:], bits)
+		buf.Write(scratch[:])
+	}
+
+	if len(doc.Metadata) > 0 {
+		metaBytes, err := json.Marshal(doc.Metadata)
+		if err != nil {
+			return err
+		}
+		buf.Write(metaBytes)
+	}
+	return nil
+}
+
+// deserializeDocument decodes binary data back to Document
+func deserializeDocument(id string, data []byte) (*types.Document, error) {
+	if len(data) < 4 {
+		return nil, fmt.Errorf("data too short")
+	}
+
+	dim := int(binary.LittleEndian.Uint32(data[0:4]))
+
+	if dim <= 0 || dim > MaxAllowedDim {
+		return nil, fmt.Errorf("invalid or corrupted dimension: %d", dim)
+	}
+
+	expectedVecSize := 4 + dim*4
+	if len(data) < expectedVecSize {
+		return nil, fmt.Errorf("data corrupted or truncated")
+	}
+
+	vec := make(types.Vector, dim)
+	offset := 4
+	for i := 0; i < dim; i++ {
+		bits := binary.LittleEndian.Uint32(data[offset : offset+4])
+		vec[i] = math.Float32frombits(bits)
+		offset += 4
+	}
+
+	var meta map[string]any
+	if len(data) > expectedVecSize {
+		if err := json.Unmarshal(data[expectedVecSize:], &meta); err != nil {
+			return nil, fmt.Errorf("metadata decode failed: %w", err)
+		}
+	}
+
+	return &types.Document{
+		ID:       id, // ID comes from the BoltDB Key
+		Vector:   vec,
+		Metadata: meta,
+	}, nil
 }
