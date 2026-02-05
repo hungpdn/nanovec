@@ -9,17 +9,17 @@ type Vector8 []uint8
 
 // Document represents a record
 type Document struct {
-	ID       string                 `json:"id"`
-	Vector   Vector                 `json:"vector"`
-	Metadata map[string]interface{} `json:"metadata"` // Additional data (payload)
+	ID       string         `json:"id"`
+	Vector   Vector         `json:"vector"`
+	Metadata map[string]any `json:"metadata"` // Additional data (payload)
 }
 
 // SearchResult returned results from a search
 type SearchResult struct {
 	ID       string  `json:"id"`
 	Score    float32 `json:"score"` // Similarity score
-	Metadata map[string]interface{}
+	Metadata map[string]any
 }
 
 // FilterFunc defines a filter for metadata
-type FilterFunc func(metadata map[string]interface{}) bool
+type FilterFunc func(metadata map[string]any) bool

@@ -30,7 +30,7 @@ type HNSWIndex struct {
 	maxLevel   int            // Current max level in the graph
 
 	// Metadata storage (Same as FlatIndex)
-	Metadata map[string]map[string]interface{}
+	Metadata map[string]map[string]any
 }
 
 // hnswNode represents a point in the graph
@@ -50,14 +50,14 @@ func NewHNSWIndex(dim, m, efConstruction int) *HNSWIndex {
 		LevelMult:      1.0 / math.Log(float64(m)),
 		nodes:          make([]*hnswNode, 0),
 		idMap:          make(map[string]int),
-		Metadata:       make(map[string]map[string]interface{}),
+		Metadata:       make(map[string]map[string]any),
 		enterPoint:     -1,
 		maxLevel:       -1,
 	}
 }
 
 // Add inserts a vector into the HNSW graph
-func (idx *HNSWIndex) Add(id string, vec types.Vector, meta map[string]interface{}) error {
+func (idx *HNSWIndex) Add(id string, vec types.Vector, meta map[string]any) error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
@@ -218,7 +218,7 @@ func (idx *HNSWIndex) Search(query types.Vector, k int, filter types.FilterFunc)
 }
 
 // AddBatch adds multiple items (For HNSW, simply loop Add)
-func (idx *HNSWIndex) AddBatch(ids []string, vecs []types.Vector, metas []map[string]interface{}) error {
+func (idx *HNSWIndex) AddBatch(ids []string, vecs []types.Vector, metas []map[string]any) error {
 	// HNSW insertion is complex to parallelize safely without fine-grained locking.
 	// For v1.1, we lock globally and loop.
 	idx.mu.Lock()

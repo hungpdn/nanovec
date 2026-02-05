@@ -26,7 +26,7 @@ type FlatIndex struct {
 	// IDs[1] correspond to the starting vector at RawVectors[dim]
 	IDs      []string
 	idMap    map[string]int
-	Metadata map[string]map[string]interface{}
+	Metadata map[string]map[string]any
 	dim      int
 }
 
@@ -35,12 +35,12 @@ func NewFlatIndex(dim int) *FlatIndex {
 		RawVectors: make([]float32, 0),
 		IDs:        make([]string, 0),
 		idMap:      make(map[string]int),
-		Metadata:   make(map[string]map[string]interface{}),
+		Metadata:   make(map[string]map[string]any),
 		dim:        dim,
 	}
 }
 
-func (idx *FlatIndex) Add(id string, vec types.Vector, meta map[string]interface{}) error {
+func (idx *FlatIndex) Add(id string, vec types.Vector, meta map[string]any) error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
@@ -64,7 +64,7 @@ func (idx *FlatIndex) Add(id string, vec types.Vector, meta map[string]interface
 }
 
 // AddBatch adds multiple vectors in a single lock transaction.
-func (idx *FlatIndex) AddBatch(ids []string, vecs []types.Vector, metas []map[string]interface{}) error {
+func (idx *FlatIndex) AddBatch(ids []string, vecs []types.Vector, metas []map[string]any) error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
@@ -261,7 +261,7 @@ func (idx *FlatIndex) Load(path string) error {
 		return err
 	}
 
-	idx.Metadata = make(map[string]map[string]interface{})
+	idx.Metadata = make(map[string]map[string]any)
 	if err := dec.Decode(&idx.Metadata); err != nil {
 		return err
 	}
@@ -284,11 +284,11 @@ type Item struct {
 }
 type ResultHeap []Item
 
-func (h ResultHeap) Len() int            { return len(h) }
-func (h ResultHeap) Less(i, j int) bool  { return h[i].Score < h[j].Score } // Min-Heap
-func (h ResultHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
-func (h *ResultHeap) Push(x interface{}) { *h = append(*h, x.(Item)) }
-func (h *ResultHeap) Pop() interface{} {
+func (h ResultHeap) Len() int           { return len(h) }
+func (h ResultHeap) Less(i, j int) bool { return h[i].Score < h[j].Score } // Min-Heap
+func (h ResultHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *ResultHeap) Push(x any)        { *h = append(*h, x.(Item)) }
+func (h *ResultHeap) Pop() any {
 	old := *h
 	n := len(old)
 	item := old[n-1]

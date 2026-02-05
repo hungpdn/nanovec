@@ -34,7 +34,7 @@ func main() {
 		{0.8, 0.9, 0.1},
 		{0.1, 0.2, 0.35},
 	}
-	metas := []map[string]interface{}{
+	metas := []map[string]any{
 		{"title": "Hello World", "category": "greeting"},
 		{"title": "Advanced Go", "category": "tech"},
 		{"title": "Vector DBs", "category": "tech"},
@@ -47,7 +47,7 @@ func main() {
 
 	fmt.Println("\n--- 3. Searching (category='tech') ---")
 	// Define a filter
-	techFilter := func(m map[string]interface{}) bool {
+	techFilter := func(m map[string]any) bool {
 		return m["category"] == "tech"
 	}
 
@@ -59,7 +59,7 @@ func main() {
 	printResults(results)
 
 	fmt.Println("\n--- 4. Updating doc1 ---")
-	newMeta := map[string]interface{}{
+	newMeta := map[string]any{
 		"title":    "Hello World v2",
 		"category": "greeting_updated",
 	}

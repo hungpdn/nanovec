@@ -56,7 +56,7 @@ func Open(path string, cfg *Config) (*DB, error) {
 		const batchSize = 1000
 		var batchIDs []string
 		var batchVecs []types.Vector
-		var batchMetas []map[string]interface{}
+		var batchMetas []map[string]any
 		count := 0
 		err := db.storage.Scan(func(doc *types.Document) error {
 			batchIDs = append(batchIDs, doc.ID)
@@ -90,7 +90,7 @@ func Open(path string, cfg *Config) (*DB, error) {
 }
 
 // Insert adds or updates a vector (Upsert behavior)
-func (db *DB) Insert(id string, vec []float32, meta map[string]interface{}) error {
+func (db *DB) Insert(id string, vec []float32, meta map[string]any) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -119,7 +119,7 @@ func (db *DB) Insert(id string, vec []float32, meta map[string]interface{}) erro
 }
 
 // InsertBatch adds multiple vectors efficiently
-func (db *DB) InsertBatch(ids []string, vecs [][]float32, metas []map[string]interface{}) error {
+func (db *DB) InsertBatch(ids []string, vecs [][]float32, metas []map[string]any) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -170,7 +170,7 @@ func (db *DB) Search(query []float32, k int, filter types.FilterFunc) ([]types.S
 }
 
 // Update updates document. Delete-then-Insert in Index.
-func (db *DB) Update(id string, newVec []float32, newMeta map[string]interface{}) error {
+func (db *DB) Update(id string, newVec []float32, newMeta map[string]any) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 

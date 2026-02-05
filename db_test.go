@@ -19,7 +19,7 @@ func assertNoError(t *testing.T, err error, msg string) {
 }
 
 // Helper to assert equality
-func assertEqual(t *testing.T, expected, actual interface{}, msg string) {
+func assertEqual(t *testing.T, expected, actual any, msg string) {
 	t.Helper()
 	if !reflect.DeepEqual(expected, actual) {
 		t.Errorf("%s: expected %v, got %v", msg, expected, actual)
@@ -44,7 +44,7 @@ func TestCrashRecovery(t *testing.T) {
 			{1.0, 0.0, 0.0},
 			{0.0, 1.0, 0.0},
 		}
-		metas := []map[string]interface{}{
+		metas := []map[string]any{
 			{"name": "A", "val": 100},
 			{"name": "B", "val": 200},
 		}
