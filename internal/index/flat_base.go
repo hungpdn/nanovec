@@ -1,4 +1,4 @@
-package flat
+package index
 
 import (
 	"encoding/gob"

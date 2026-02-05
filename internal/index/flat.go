@@ -1,4 +1,4 @@
-package flat
+package index
 
 import (
 	"container/heap"
@@ -12,48 +12,85 @@ import (
 	"github.com/hungpdn/nanovec/pkg/types"
 )
 
-// FlatIndexSQ8 stores vectors as uint8 (SQ8) to save 4x RAM.
-type FlatIndexSQ8 struct {
+// FlatIndex is a generic implementation for both Float32 and SQ8 (Uint8)
+type FlatIndex[T types.Number] struct {
 	BaseIndex
-	// Data in RAM (Compressed)
-	RawVectors []uint8
+	RawVectors []T
+
+	// Injected behavior
+	// storeFunc processes a vector and writes it to the destination slice
+	// src is the input vector, dst is the slice in RawVectors, buf is a temp buffer (for SQ8)
+	storeFunc func(src []float32, dst []T, buf []float32)
+	// scoreFunc calculates similarity between query and target vector
+	scoreFunc func(query []float32, target []T) float32
 }
 
-func NewFlatIndexSQ8(dim int) *FlatIndexSQ8 {
-	return &FlatIndexSQ8{
+// NewFlatIndexFloat creates a standard Float32 index
+func NewFlatIndexFloat(dim int) *FlatIndex[float32] {
+	return &FlatIndex[float32]{
 		BaseIndex:  NewBaseIndex(dim),
-		RawVectors: make([]uint8, 0),
+		RawVectors: make([]float32, 0),
+		storeFunc: func(src []float32, dst []float32, _ []float32) {
+			copy(dst, src)
+			maths.NormalizeInPlace(dst)
+		},
+		scoreFunc: maths.DotProduct,
 	}
 }
 
-// Add
-func (idx *FlatIndexSQ8) Add(id string, vec types.Vector, meta map[string]any) error {
+// NewFlatIndexSQ8 creates a Quantized SQ8 index
+func NewFlatIndexSQ8(dim int) *FlatIndex[uint8] {
+	return &FlatIndex[uint8]{
+		BaseIndex:  NewBaseIndex(dim),
+		RawVectors: make([]uint8, 0),
+		storeFunc: func(src []float32, dst []uint8, buf []float32) {
+			// Copy to temp buffer to normalize before quantizing
+			copy(buf, src)
+			maths.NormalizeInPlace(buf)
+			// Quantize directly to destination
+			for i, v := range buf {
+				val := (v + 1.0) * 127.5
+				if val < 0 {
+					val = 0
+				} else if val > 255 {
+					val = 255
+				}
+				dst[i] = uint8(val)
+			}
+		},
+		scoreFunc: maths.DotProductSQ8,
+	}
+}
+
+// Add adds a single vector
+func (idx *FlatIndex[T]) Add(id string, vec types.Vector, meta map[string]any) error {
 	idx.Lock()
 	defer idx.Unlock()
 
 	if len(vec) != idx.dim {
 		return errors.ErrDimMismatch
 	}
-
 	if err := idx.CheckID(id); err != nil {
 		return err
 	}
 
-	// Normalize (Required for SQ8 accuracy)
-	// We copy to avoid modifying caller's vector if they didn't normalize
-	normVec := make(types.Vector, len(vec))
-	copy(normVec, vec)
-	maths.NormalizeInPlace(normVec)
+	startPos := len(idx.RawVectors)
+	// Append zero-values to grow slice
+	idx.RawVectors = append(idx.RawVectors, make([]T, idx.dim)...)
 
-	qVec := maths.QuantizeSQ8(normVec)
-	idx.RawVectors = append(idx.RawVectors, qVec...)
+	// Helper buffer for SQ8 (unused for Float32 storeFunc)
+	var buf []float32
+	if _, ok := any(idx.RawVectors).([]uint8); ok {
+		buf = make([]float32, idx.dim)
+	}
 
+	idx.storeFunc(vec, idx.RawVectors[startPos:], buf)
 	idx.AddMeta(id, meta)
 	return nil
 }
 
-// AddBatch
-func (idx *FlatIndexSQ8) AddBatch(ids []string, vecs []types.Vector, metas []map[string]any) error {
+// AddBatch adds multiple vectors
+func (idx *FlatIndex[T]) AddBatch(ids []string, vecs []types.Vector, metas []map[string]any) error {
 	idx.Lock()
 	defer idx.Unlock()
 
@@ -61,52 +98,38 @@ func (idx *FlatIndexSQ8) AddBatch(ids []string, vecs []types.Vector, metas []map
 		return errors.ErrBatchSizeMismatch
 	}
 
-	needed := 0
 	for _, v := range vecs {
 		if len(v) != idx.dim {
 			return errors.ErrDimMismatch
 		}
-		needed += len(v)
 	}
-
 	for _, id := range ids {
 		if err := idx.CheckID(id); err != nil {
 			return err
 		}
 	}
 
-	idx.RawVectors = slices.Grow(idx.RawVectors, needed)
+	currentLen := len(idx.RawVectors)
+	addLen := len(ids) * idx.dim
+	idx.RawVectors = slices.Grow(idx.RawVectors, addLen)
+	idx.RawVectors = idx.RawVectors[:currentLen+addLen]
 	idx.IDs = slices.Grow(idx.IDs, len(ids))
 
-	normBuf := make(types.Vector, idx.dim)
+	normBuf := make([]float32, idx.dim)
+
 	for i, id := range ids {
-		meta := metas[i]
+		start := currentLen + (i * idx.dim)
+		dst := idx.RawVectors[start : start+idx.dim]
 
-		copy(normBuf, vecs[i])
-		maths.NormalizeInPlace(normBuf)
-
-		// OPTIMIZATION: Inline Quantization
-		// Write directly to RawVectors (which was already grown via slices.Grow)
-		// This avoids allocating the intermediate 'qVec' slice for every vector.
-		for _, v := range normBuf {
-			val := (v + 1.0) * 127.5
-			if val < 0 {
-				val = 0
-			}
-			if val > 255 {
-				val = 255
-			}
-			idx.RawVectors = append(idx.RawVectors, uint8(val))
-		}
-
-		idx.AddMeta(id, meta)
+		idx.storeFunc(vecs[i], dst, normBuf)
+		idx.AddMeta(id, metas[i])
 	}
 
 	return nil
 }
 
-// Search
-func (idx *FlatIndexSQ8) Search(query types.Vector, k int, filter types.FilterFunc) ([]types.SearchResult, error) {
+// Search finds k nearest neighbors.
+func (idx *FlatIndex[T]) Search(query types.Vector, k int, filter types.FilterFunc) ([]types.SearchResult, error) {
 	idx.RLock()
 	defer idx.RUnlock()
 
@@ -132,9 +155,8 @@ func (idx *FlatIndexSQ8) Search(query types.Vector, k int, filter types.FilterFu
 		}
 
 		start := i * idx.dim
-		end := start + idx.dim
-		qVec := idx.RawVectors[start:end]
-		score := maths.DotProductSQ8(normalizedQuery, qVec)
+		targetVec := idx.RawVectors[start : start+idx.dim]
+		score := idx.scoreFunc(normalizedQuery, targetVec)
 
 		if h.Len() < k {
 			heap.Push(h, Item{ID: id, Score: score})
@@ -157,8 +179,8 @@ func (idx *FlatIndexSQ8) Search(query types.Vector, k int, filter types.FilterFu
 	return results, nil
 }
 
-// Delete
-func (idx *FlatIndexSQ8) Delete(id string) error {
+// Delete removes a vector.
+func (idx *FlatIndex[T]) Delete(id string) error {
 	idx.Lock()
 	defer idx.Unlock()
 
@@ -174,13 +196,12 @@ func (idx *FlatIndexSQ8) Delete(id string) error {
 	}
 
 	idx.RawVectors = idx.RawVectors[:lastIndex*idx.dim]
-
 	idx.CommitDelete(id, pos, lastIndex)
 	return nil
 }
 
-// Save
-func (idx *FlatIndexSQ8) Save(path string) error {
+// Save persists to disk.
+func (idx *FlatIndex[T]) Save(path string) error {
 	idx.Lock()
 	defer idx.Unlock()
 
@@ -215,8 +236,8 @@ func (idx *FlatIndexSQ8) Save(path string) error {
 	return os.Rename(tmpPath, path)
 }
 
-// Load
-func (idx *FlatIndexSQ8) Load(path string) error {
+// Load reads from disk.
+func (idx *FlatIndex[T]) Load(path string) error {
 	idx.Lock()
 	defer idx.Unlock()
 
@@ -233,11 +254,9 @@ func (idx *FlatIndexSQ8) Load(path string) error {
 	idx.dim = int(header[0])
 
 	dec := gob.NewDecoder(f)
-
 	if err := idx.LoadBase(dec); err != nil {
 		return err
 	}
-	// Load Raw uint8 vectors
 	if err := dec.Decode(&idx.RawVectors); err != nil {
 		return err
 	}
