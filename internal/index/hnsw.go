@@ -734,7 +734,7 @@ func (idx *HNSWIndex[T]) Save(path string) error {
 	}
 
 	// 4. Tombstones (Binary) to 'w'
-	if err := idx.tombstones.Save(w); err != nil {
+	if err = idx.tombstones.Save(w); err != nil {
 		return err
 	}
 
