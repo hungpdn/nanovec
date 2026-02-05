@@ -5,7 +5,9 @@ import (
 	"encoding/binary"
 	"encoding/gob"
 	"errors"
+	"fmt"
 	"os"
+	"slices"
 	"sync"
 
 	"github.com/hungpdn/nanovec/pkg/maths"
@@ -44,7 +46,7 @@ func (idx *FlatIndex) Add(id string, vec types.Vector, meta map[string]interface
 	defer idx.mu.Unlock()
 
 	if len(vec) != idx.Dim {
-		return errors.New("dimension mismatch")
+		return types.ErrDimMismatch
 	}
 
 	if _, exists := idx.idMap[id]; exists {
@@ -58,6 +60,47 @@ func (idx *FlatIndex) Add(id string, vec types.Vector, meta map[string]interface
 	idx.IDs = append(idx.IDs, id)
 	idx.idMap[id] = len(idx.IDs) - 1
 	idx.Metadata[id] = meta
+
+	return nil
+}
+
+// AddBatch adds multiple vectors in a single lock transaction.
+func (idx *FlatIndex) AddBatch(ids []string, vecs []types.Vector, metas []map[string]interface{}) error {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	if len(ids) != len(vecs) || len(ids) != len(metas) {
+		return errors.New("batch size mismatch")
+	}
+
+	needed := 0
+	for _, v := range vecs {
+		if len(v) != idx.Dim {
+			return types.ErrDimMismatch
+		}
+		needed += len(v)
+	}
+
+	for _, id := range ids {
+		if _, exists := idx.idMap[id]; exists {
+			return fmt.Errorf("id %s already exists", id)
+		}
+	}
+
+	idx.RawVectors = slices.Grow(idx.RawVectors, needed)
+
+	for i, id := range ids {
+		vec := vecs[i]
+		meta := metas[i]
+
+		startPos := len(idx.RawVectors)
+		idx.RawVectors = append(idx.RawVectors, vec...)
+		maths.NormalizeInPlace(idx.RawVectors[startPos:])
+
+		idx.IDs = append(idx.IDs, id)
+		idx.idMap[id] = len(idx.IDs) - 1
+		idx.Metadata[id] = meta
+	}
 
 	return nil
 }
@@ -91,7 +134,7 @@ func (idx *FlatIndex) Delete(id string) error {
 	return nil
 }
 
-func (idx *FlatIndex) Search(query types.Vector, k int, filter types.FilterFunc) ([]string, []float32, error) {
+func (idx *FlatIndex) Search(query types.Vector, k int, filter types.FilterFunc) ([]types.SearchResult, error) {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
@@ -120,7 +163,7 @@ func (idx *FlatIndex) Search(query types.Vector, k int, filter types.FilterFunc)
 		start := i * idx.Dim
 		end := start + idx.Dim
 		targetVec := idx.RawVectors[start:end]
-		score := maths.DotProduct(query, targetVec) // TODO: call SIMD
+		score := maths.DotProduct(query, targetVec)
 
 		if h.Len() < k {
 			heap.Push(h, Item{ID: id, Score: score})
@@ -130,17 +173,20 @@ func (idx *FlatIndex) Search(query types.Vector, k int, filter types.FilterFunc)
 		}
 	}
 
-	ids := make([]string, h.Len())
-	scores := make([]float32, h.Len())
+	results := make([]types.SearchResult, h.Len())
 
 	// Pop returns the order from smallest to largest
 	for i := h.Len() - 1; i >= 0; i-- {
 		item := heap.Pop(h).(Item)
-		ids[i] = item.ID
-		scores[i] = item.Score
+		meta := idx.Metadata[item.ID]
+		results[i] = types.SearchResult{
+			ID:       item.ID,
+			Score:    item.Score,
+			Metadata: meta, //
+		}
 	}
 
-	return ids, scores, nil
+	return results, nil
 }
 
 func (idx *FlatIndex) Count() int {
@@ -153,11 +199,11 @@ func (idx *FlatIndex) Save(path string) error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
-	f, err := os.Create(path)
+	tmpPath := path + ".tmp"
+	f, err := os.Create(tmpPath)
 	if err != nil {
 		return err
 	}
-
 	defer f.Close()
 
 	header := make([]int32, 2)
@@ -174,11 +220,18 @@ func (idx *FlatIndex) Save(path string) error {
 	if err := enc.Encode(idx.Metadata); err != nil {
 		return err
 	}
-	if err := binary.Write(f, binary.LittleEndian, idx.RawVectors); err != nil {
+	if err := enc.Encode(idx.RawVectors); err != nil {
 		return err
 	}
 
-	return nil
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+
+	return os.Rename(tmpPath, path)
 }
 
 // Load: read data from disk
@@ -197,7 +250,6 @@ func (idx *FlatIndex) Load(path string) error {
 		return err
 	}
 	idx.Dim = int(header[0])
-	count := int(header[1])
 
 	dec := gob.NewDecoder(f)
 	if err := dec.Decode(&idx.IDs); err != nil {
@@ -214,8 +266,7 @@ func (idx *FlatIndex) Load(path string) error {
 		idx.idMap[id] = i
 	}
 
-	idx.RawVectors = make([]float32, count*idx.Dim)
-	if err := binary.Read(f, binary.LittleEndian, &idx.RawVectors); err != nil {
+	if err := dec.Decode(&idx.RawVectors); err != nil {
 		return err
 	}
 

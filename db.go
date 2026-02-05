@@ -35,6 +35,9 @@ func Open(path string, cfg *Config) (*DB, error) {
 	indexPath := path + ".idx"
 	err = idx.Load(indexPath)
 	indexLoaded := err == nil
+	if !indexLoaded {
+		idx = index.NewFlatIndex(cfg.Dimension)
+	}
 
 	if indexLoaded && idx.Dim != cfg.Dimension {
 		cfg.Dimension = idx.Dim
@@ -47,21 +50,41 @@ func Open(path string, cfg *Config) (*DB, error) {
 		storage: store,
 	}
 
+	// Self-Healing: Rebuild index if missing or empty
 	if !indexLoaded || idx.Count() == 0 {
 		fmt.Println("⚠️ Index missing or empty. Rebuilding from Storage...")
+
+		const batchSize = 1000
+		var batchIDs []string
+		var batchVecs []types.Vector
+		var batchMetas []map[string]interface{}
 		count := 0
 		err := db.storage.Scan(func(doc *types.Document) error {
-			if err := db.index.Add(doc.ID, doc.Vector, doc.Metadata); err != nil {
-				return err
+			batchIDs = append(batchIDs, doc.ID)
+			batchVecs = append(batchVecs, doc.Vector)
+			batchMetas = append(batchMetas, doc.Metadata)
+
+			if len(batchIDs) >= batchSize {
+				if err := db.index.AddBatch(batchIDs, batchVecs, batchMetas); err != nil {
+					return err
+				}
+				batchIDs = batchIDs[:0]
+				batchVecs = batchVecs[:0]
+				batchMetas = batchMetas[:0]
 			}
 			count++
 			return nil
 		})
 
+		if len(batchIDs) > 0 {
+			if err := db.index.AddBatch(batchIDs, batchVecs, batchMetas); err != nil {
+				return nil, fmt.Errorf("failed to flush remaining batch: %v", err)
+			}
+		}
 		if err != nil {
 			return nil, fmt.Errorf("failed to rebuild index: %v", err)
 		}
-		fmt.Printf("✅ Restored %d vectors from storage.\n", count)
+		fmt.Printf("✅ Restored %d vectors from storage (Batched).\n", count)
 	}
 
 	return db, nil
@@ -73,7 +96,7 @@ func (db *DB) Insert(id string, vec []float32, meta map[string]interface{}) erro
 	defer db.mu.Unlock()
 
 	if len(vec) != db.config.Dimension {
-		return ErrDimMismatch
+		return types.ErrDimMismatch
 	}
 
 	doc := &types.Document{
@@ -89,8 +112,46 @@ func (db *DB) Insert(id string, vec []float32, meta map[string]interface{}) erro
 	// Note: If this fails (e.g. OOM), the DB is in a "Storage-Index mismatch" state.
 	// A WAL replay on restart would fix this.
 	_ = db.index.Delete(id)
-	if err := db.index.Add(id, types.Vector(vec), nil); err != nil {
+	if err := db.index.Add(id, types.Vector(vec), meta); err != nil {
 		return err
+	}
+
+	return nil
+}
+
+// InsertBatch adds multiple vectors efficiently
+func (db *DB) InsertBatch(ids []string, vecs [][]float32, metas []map[string]interface{}) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	if len(ids) != len(vecs) || len(ids) != len(metas) {
+		return fmt.Errorf("batch size mismatch")
+	}
+
+	typeVectors := make([]types.Vector, len(vecs))
+
+	for i, id := range ids {
+		if len(vecs[i]) != db.config.Dimension {
+			return types.ErrDimMismatch
+		}
+		typeVectors[i] = types.Vector(vecs[i])
+
+		doc := &types.Document{
+			ID:       id,
+			Vector:   typeVectors[i],
+			Metadata: metas[i],
+		}
+		if err := db.storage.Put(doc); err != nil {
+			return fmt.Errorf("storage batch write failed at index %d: %v", i, err)
+		}
+	}
+
+	for _, id := range ids {
+		_ = db.index.Delete(id)
+	}
+
+	if err := db.index.AddBatch(ids, typeVectors, metas); err != nil {
+		return fmt.Errorf("index batch update failed: %v", err)
 	}
 
 	return nil
@@ -103,30 +164,10 @@ func (db *DB) Search(query []float32, k int, filter types.FilterFunc) ([]types.S
 	defer db.mu.RUnlock()
 
 	if len(query) != db.config.Dimension {
-		return nil, ErrQueryDimMismatch
+		return nil, types.ErrQueryDimMismatch
 	}
 
-	ids, scores, err := db.index.Search(types.Vector(query), k, filter)
-	if err != nil {
-		return nil, err
-	}
-
-	results := make([]types.SearchResult, 0, len(ids))
-	for i, id := range ids {
-		doc, err := db.storage.Get(id)
-		if err != nil {
-			// Determine policy: Skip or return partial?
-			// Here we skip, assuming index might be slightly ahead/behind or consistency issue
-			continue
-		}
-		results = append(results, types.SearchResult{
-			ID:       doc.ID,
-			Score:    scores[i],
-			Metadata: doc.Metadata,
-		})
-	}
-
-	return results, nil
+	return db.index.Search(types.Vector(query), k, filter)
 }
 
 // Update updates document. Delete-then-Insert in Index.
@@ -144,11 +185,9 @@ func (db *DB) Update(id string, newVec []float32, newMeta map[string]interface{}
 	}
 
 	finalVec := oldDoc.Vector
-	vectorChanged := false
 
 	if len(newVec) > 0 {
 		finalVec = types.Vector(newVec)
-		vectorChanged = true
 	}
 
 	finalMeta := oldDoc.Metadata
@@ -166,11 +205,9 @@ func (db *DB) Update(id string, newVec []float32, newMeta map[string]interface{}
 		return err
 	}
 
-	if vectorChanged {
-		_ = db.index.Delete(id)
-		if err := db.index.Add(id, finalVec, finalMeta); err != nil {
-			return err
-		}
+	_ = db.index.Delete(id)
+	if err := db.index.Add(id, finalVec, finalMeta); err != nil {
+		return err
 	}
 
 	return nil
