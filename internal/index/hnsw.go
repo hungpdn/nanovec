@@ -31,11 +31,12 @@ type HNSWIndex[T types.Number] struct {
 	enterPoint int            // Internal Index of the entry node
 	maxLevel   int            // Current max level in the graph
 
-	// Optimization: Reuse visited maps to reduce GC pressure
-	visitedPool sync.Pool
-	// Metadata storage (Same as FlatIndex)
 	Metadata map[string]map[string]any
 	Version  uint64
+
+	// visitedList stores the "visit token" for each node internal ID.
+	visitedList  []uint32
+	visitedToken uint32 // Current search generation
 
 	// Injected behavior
 	// convertFunc converts input float32 vector to storage type T
@@ -98,10 +99,6 @@ func newHNSWIndex[T types.Number](dim, m, efConstruction int,
 		convertFunc:    conv,
 		distQueryFunc:  distQ,
 		distNodeFunc:   distN,
-	}
-
-	idx.visitedPool.New = func() any {
-		return make(map[int]bool, efConstruction)
 	}
 	return idx
 }
@@ -216,13 +213,22 @@ func (idx *HNSWIndex[T]) internalAdd(id string, vec types.Vector, meta map[strin
 // searchLayer performs BFS with priority queue (Beam Search)
 // Returns list of candidates sorted by Score DESC (Closest first)
 func (idx *HNSWIndex[T]) searchLayer(query types.Vector, entryPoint, ef, level int) []pqItem {
-	visited := idx.visitedPool.Get().(map[int]bool)
-	defer func() {
-		clear(visited)
-		idx.visitedPool.Put(visited)
-	}()
 
-	visited[entryPoint] = true
+	idx.visitedToken++
+	if idx.visitedToken == 0 {
+		idx.visitedToken = 1
+		for i := range idx.visitedList {
+			idx.visitedList[i] = 0
+		}
+	}
+
+	if len(idx.visitedList) < len(idx.nodes) {
+		newVis := make([]uint32, len(idx.nodes))
+		copy(newVis, idx.visitedList)
+		idx.visitedList = newVis
+	}
+
+	idx.visitedList[entryPoint] = idx.visitedToken
 
 	candidates := &MaxHeap{}
 	heap.Init(candidates)
@@ -244,8 +250,8 @@ func (idx *HNSWIndex[T]) searchLayer(query types.Vector, entryPoint, ef, level i
 		}
 
 		for _, neighborID := range idx.nodes[curr.id].Neighbors[level] {
-			if !visited[neighborID] {
-				visited[neighborID] = true
+			if idx.visitedList[neighborID] != idx.visitedToken {
+				idx.visitedList[neighborID] = idx.visitedToken
 				dist := idx.distQueryFunc(query, idx.nodes[neighborID].Vec)
 				newItem := pqItem{id: neighborID, score: dist}
 
