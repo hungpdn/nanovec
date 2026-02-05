@@ -1,6 +1,8 @@
 package internal
 
-import "github.com/hungpdn/nanovec/pkg/types"
+import (
+	"github.com/hungpdn/nanovec/pkg/types"
+)
 
 // VectorIndex: Interface for search algorithms (HNSW, Flat...)
 type VectorIndex interface {
@@ -10,6 +12,8 @@ type VectorIndex interface {
 	Search(vec types.Vector, k int, filter types.FilterFunc) ([]types.SearchResult, error)
 	Save(path string) error
 	Load(path string) error
+	Dim() int
+	Count() int
 }
 
 // Storage: Interface for persistent storage

@@ -5,7 +5,6 @@ import (
 	"sync"
 
 	"github.com/hungpdn/nanovec/internal"
-	"github.com/hungpdn/nanovec/internal/index"
 	"github.com/hungpdn/nanovec/internal/storage"
 	"github.com/hungpdn/nanovec/pkg/types"
 )
@@ -31,16 +30,16 @@ func Open(path string, cfg *Config) (*DB, error) {
 		return nil, err
 	}
 
-	idx := index.NewFlatIndex(cfg.Dimension)
+	idx := cfg.GetVectorIndex()
 	indexPath := path + ".idx"
 	err = idx.Load(indexPath)
-	indexLoaded := err == nil
-	if !indexLoaded {
-		idx = index.NewFlatIndex(cfg.Dimension)
+	if err != nil {
+		idx = cfg.GetVectorIndex()
 	}
+	indexLoaded := err == nil
 
-	if indexLoaded && idx.Dim != cfg.Dimension {
-		cfg.Dimension = idx.Dim
+	if indexLoaded && idx.Dim() != cfg.Dimension {
+		cfg.Dimension = idx.Dim()
 	}
 
 	db := &DB{

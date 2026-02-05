@@ -27,7 +27,7 @@ type FlatIndex struct {
 	IDs      []string
 	idMap    map[string]int
 	Metadata map[string]map[string]interface{}
-	Dim      int
+	dim      int
 }
 
 func NewFlatIndex(dim int) *FlatIndex {
@@ -36,7 +36,7 @@ func NewFlatIndex(dim int) *FlatIndex {
 		IDs:        make([]string, 0),
 		idMap:      make(map[string]int),
 		Metadata:   make(map[string]map[string]interface{}),
-		Dim:        dim,
+		dim:        dim,
 	}
 }
 
@@ -44,7 +44,7 @@ func (idx *FlatIndex) Add(id string, vec types.Vector, meta map[string]interface
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
-	if len(vec) != idx.Dim {
+	if len(vec) != idx.dim {
 		return types.ErrDimMismatch
 	}
 
@@ -74,7 +74,7 @@ func (idx *FlatIndex) AddBatch(ids []string, vecs []types.Vector, metas []map[st
 
 	needed := 0
 	for _, v := range vecs {
-		if len(v) != idx.Dim {
+		if len(v) != idx.dim {
 			return types.ErrDimMismatch
 		}
 		needed += len(v)
@@ -120,15 +120,15 @@ func (idx *FlatIndex) Delete(id string) error {
 		idx.IDs[pos] = lastID
 		idx.idMap[lastID] = pos
 
-		destStart := pos * idx.Dim
-		srcStart := lastIndex * idx.Dim
-		copy(idx.RawVectors[destStart:destStart+idx.Dim], idx.RawVectors[srcStart:srcStart+idx.Dim])
+		destStart := pos * idx.dim
+		srcStart := lastIndex * idx.dim
+		copy(idx.RawVectors[destStart:destStart+idx.dim], idx.RawVectors[srcStart:srcStart+idx.dim])
 	}
 
 	delete(idx.idMap, id)
 	delete(idx.Metadata, id)
 	idx.IDs = idx.IDs[:lastIndex]
-	idx.RawVectors = idx.RawVectors[:lastIndex*idx.Dim]
+	idx.RawVectors = idx.RawVectors[:lastIndex*idx.dim]
 
 	return nil
 }
@@ -159,8 +159,8 @@ func (idx *FlatIndex) Search(query types.Vector, k int, filter types.FilterFunc)
 		}
 
 		// Slice bounds check is eliminated by compiler here due to simple ranges
-		start := i * idx.Dim
-		end := start + idx.Dim
+		start := i * idx.dim
+		end := start + idx.dim
 		targetVec := idx.RawVectors[start:end]
 		score := maths.DotProduct(query, targetVec)
 
@@ -194,6 +194,12 @@ func (idx *FlatIndex) Count() int {
 	return len(idx.IDs)
 }
 
+func (idx *FlatIndex) Dim() int {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return idx.dim
+}
+
 func (idx *FlatIndex) Save(path string) error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
@@ -206,7 +212,7 @@ func (idx *FlatIndex) Save(path string) error {
 	defer f.Close()
 
 	header := make([]int32, 2)
-	header[0] = int32(idx.Dim)
+	header[0] = int32(idx.dim)
 	header[1] = int32(len(idx.IDs))
 	if err := binary.Write(f, binary.LittleEndian, header); err != nil {
 		return err
@@ -248,7 +254,7 @@ func (idx *FlatIndex) Load(path string) error {
 	if err := binary.Read(f, binary.LittleEndian, &header); err != nil {
 		return err
 	}
-	idx.Dim = int(header[0])
+	idx.dim = int(header[0])
 
 	dec := gob.NewDecoder(f)
 	if err := dec.Decode(&idx.IDs); err != nil {
