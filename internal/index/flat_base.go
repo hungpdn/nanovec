@@ -18,6 +18,7 @@ type BaseIndex struct {
 	idMap    map[string]int
 	IDs      []string
 	Metadata map[string]map[string]any
+	Version  uint64
 }
 
 func NewBaseIndex(dim int) BaseIndex {
@@ -83,6 +84,18 @@ func (idx *BaseIndex) Count() int {
 	idx.RLock()
 	defer idx.RUnlock()
 	return len(idx.IDs)
+}
+
+func (idx *BaseIndex) SetVersion(v uint64) {
+	idx.Lock()
+	defer idx.Unlock()
+	idx.Version = v
+}
+
+func (idx *BaseIndex) GetVersion() uint64 {
+	idx.Lock()
+	defer idx.Unlock()
+	return idx.Version
 }
 
 // SaveBase: save common sections (IDs, Metadata)

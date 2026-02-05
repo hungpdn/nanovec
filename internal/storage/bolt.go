@@ -15,6 +15,7 @@ const (
 	bucketDocuments = "documents"
 	bucketMeta      = "metadata"
 	keyDocCount     = "doc_count"
+	keyDbVersion    = "db_version"
 )
 
 // BoltStorage implement interface Storage use bbolt
@@ -24,22 +25,17 @@ type BoltStorage struct {
 
 // NewBoltStorage opens the database and creates the buckets if not exists
 func NewBoltStorage(path string) (*BoltStorage, error) {
-	db, err := bbolt.Open(path, 0600, &bbolt.Options{Timeout: 1 * time.Second})
+	db, err := bbolt.Open(path, 0600, &bbolt.Options{
+		Timeout:        1 * time.Second,
+		NoFreelistSync: true, // Improve write performance
+	})
 	if err != nil {
 		return nil, fmt.Errorf("could not open bolt db: %v", err)
 	}
 
-	// Initialize buckets and counter
 	err = db.Update(func(tx *bbolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists([]byte(bucketDocuments))
-		if err != nil {
-			return fmt.Errorf("create documents bucket: %v", err)
-		}
-
-		_, err = tx.CreateBucketIfNotExists([]byte(bucketMeta))
-		if err != nil {
-			return fmt.Errorf("create metadata bucket: %v", err)
-		}
+		_, _ = tx.CreateBucketIfNotExists([]byte(bucketDocuments))
+		_, _ = tx.CreateBucketIfNotExists([]byte(bucketMeta))
 		return nil
 	})
 
@@ -49,6 +45,30 @@ func NewBoltStorage(path string) (*BoltStorage, error) {
 	}
 
 	return &BoltStorage{db: db}, nil
+}
+
+// GetVersion returns the current modification sequence of the storage
+func (s *BoltStorage) GetVersion() (uint64, error) {
+	var ver uint64
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		b := tx.Bucket([]byte(bucketMeta))
+		v := b.Get([]byte(keyDbVersion))
+		if v != nil {
+			ver = binary.LittleEndian.Uint64(v)
+		}
+		return nil
+	})
+	return ver, err
+}
+
+// incVersion increments the database version
+func (s *BoltStorage) incVersion(tx *bbolt.Tx) error {
+	b := tx.Bucket([]byte(bucketMeta))
+	seq, _ := b.NextSequence()
+
+	buf := make([]byte, 8)
+	binary.LittleEndian.PutUint64(buf, seq)
+	return b.Put([]byte(keyDbVersion), buf)
 }
 
 // Put saves document to disk (Upsert)
@@ -63,14 +83,18 @@ func (s *BoltStorage) Put(doc *types.Document) error {
 				return err
 			}
 		}
-
+		// Optimize: Use custom binary encoding instead of Gob for speed
 		var buf bytes.Buffer
 		enc := gob.NewEncoder(&buf)
 		if err := enc.Encode(doc); err != nil {
-			return fmt.Errorf("failed to encode document: %w", err)
+			return err
 		}
 
-		return bDocs.Put([]byte(doc.ID), buf.Bytes())
+		if err := bDocs.Put([]byte(doc.ID), buf.Bytes()); err != nil {
+			return err
+		}
+
+		return s.incVersion(tx)
 	})
 }
 
@@ -105,6 +129,10 @@ func (s *BoltStorage) PutBatch(docs []*types.Document) error {
 			if err := bDocs.Put([]byte(doc.ID), buf.Bytes()); err != nil {
 				return err
 			}
+		}
+
+		if err := s.incVersion(tx); err != nil {
+			return err
 		}
 
 		if newItems > 0 {

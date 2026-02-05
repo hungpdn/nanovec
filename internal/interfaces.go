@@ -14,6 +14,8 @@ type VectorIndex interface {
 	Load(path string) error
 	Dim() int
 	Count() int
+	SetVersion(v uint64)
+	GetVersion() uint64
 }
 
 // Storage: Interface for persistent storage
@@ -26,4 +28,5 @@ type Storage interface {
 	Has(id string) bool
 	Count() (int, error)
 	Close() error
+	GetVersion() (uint64, error)
 }

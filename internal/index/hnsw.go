@@ -35,6 +35,7 @@ type HNSWIndex[T types.Number] struct {
 	visitedPool sync.Pool
 	// Metadata storage (Same as FlatIndex)
 	Metadata map[string]map[string]any
+	Version  uint64
 
 	// Injected behavior
 	// convertFunc converts input float32 vector to storage type T
@@ -390,6 +391,18 @@ func (idx *HNSWIndex[T]) Dim() int {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 	return idx.dim
+}
+
+func (idx *HNSWIndex[T]) SetVersion(v uint64) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	idx.Version = v
+}
+
+func (idx *HNSWIndex[T]) GetVersion() uint64 {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	return idx.Version
 }
 
 // Persistence

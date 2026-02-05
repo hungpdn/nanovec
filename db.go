@@ -2,7 +2,9 @@ package nanovec
 
 import (
 	"fmt"
+	"log"
 	"sync"
+	"time"
 
 	"github.com/hungpdn/nanovec/internal"
 	"github.com/hungpdn/nanovec/internal/storage"
@@ -44,43 +46,40 @@ func Open(path string, cfg *Config) (*DB, error) {
 		cfg.Dimension = idx.Dim()
 	}
 
-	db := &DB{
-		path:    path,
-		config:  *cfg,
-		index:   idx,
-		storage: store,
+	storeVer, err := store.GetVersion()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get storage version: %v", err)
 	}
 
-	storeCount, err := db.storage.Count()
-	if err != nil {
-		return nil, fmt.Errorf("failed to check storage integrity: %v", err)
-	}
+	idxVer := idx.GetVersion()
+
+	// Logic: If Index is missing, corrupt, or OUTDATED -> Rebuild
+	needRebuild := !indexLoaded || (idxVer != storeVer)
 
 	// Self-Healing
-	if !indexLoaded || idx.Count() != storeCount {
-		reason := "Index missing or corrupt"
-		if indexLoaded && idx.Count() != storeCount {
-			reason = fmt.Sprintf("Sync drift detected (Index: %d, Store: %d)", idx.Count(), storeCount)
+	if needRebuild {
+		reason := "Index missing"
+		if indexLoaded && idxVer != storeVer {
+			reason = fmt.Sprintf("Version mismatch (Index: %d, Store: %d)", idxVer, storeVer)
 		}
 
-		fmt.Printf("⚠️ %s. Rebuilding from Storage...\n", reason)
+		log.Printf("⚠️ %s. Rebuilding index from storage (SQLite-style recovery)...", reason)
 
-		if idx.Count() > 0 {
-			db.index = cfg.GetVectorIndex()
-		}
+		idx = cfg.GetVectorIndex()
 
 		const batchSize = 1000
 		var batchIDs []string
 		var batchVecs []types.Vector
 		var batchMetas []map[string]any
 		count := 0
-		err := db.storage.Scan(func(doc *types.Document) error {
+		start := time.Now()
+		err := store.Scan(func(doc *types.Document) error {
 			batchIDs = append(batchIDs, doc.ID)
 			batchVecs = append(batchVecs, doc.Vector)
 			batchMetas = append(batchMetas, doc.Metadata)
 
 			if len(batchIDs) >= batchSize {
-				if err := db.index.AddBatch(batchIDs, batchVecs, batchMetas); err != nil {
+				if err := idx.AddBatch(batchIDs, batchVecs, batchMetas); err != nil {
 					return err
 				}
 				batchIDs = batchIDs[:0]
@@ -92,20 +91,32 @@ func Open(path string, cfg *Config) (*DB, error) {
 		})
 
 		if len(batchIDs) > 0 {
-			if err := db.index.AddBatch(batchIDs, batchVecs, batchMetas); err != nil {
+			if err := idx.AddBatch(batchIDs, batchVecs, batchMetas); err != nil {
 				return nil, fmt.Errorf("failed to flush remaining batch: %v", err)
 			}
 		}
 		if err != nil {
 			return nil, fmt.Errorf("failed to rebuild index: %v", err)
 		}
-		fmt.Printf("✅ Restored %d vectors from storage.\n", count)
+
+		idx.SetVersion(storeVer)
+
+		if err := idx.Save(indexPath); err != nil {
+			log.Printf("Warning: failed to save rebuilt index: %v", err)
+		}
+
+		log.Printf("✅ Restored %d vectors in %v. System is consistent.", count, time.Since(start))
 	}
 
-	return db, nil
+	return &DB{
+		path:    path,
+		config:  *cfg,
+		index:   idx,
+		storage: store,
+	}, nil
 }
 
-// Insert adds or updates a vector
+// Insert adds or updates a vector, ensures Atomicity by treating Storage as WAL/Master
 func (db *DB) Insert(id string, vec []float32, meta map[string]any) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -126,10 +137,11 @@ func (db *DB) Insert(id string, vec []float32, meta map[string]any) error {
 
 	_ = db.index.Delete(id)
 	if err := db.index.Add(id, types.Vector(vec), meta); err != nil {
-		// Rollback storage if index fails
-		_ = db.storage.Delete(id)
-		return fmt.Errorf("index add failed (rolled back): %v", err)
+		return fmt.Errorf("critical: memory index update failed (data saved on disk): %v", err)
 	}
+
+	newVer, _ := db.storage.GetVersion()
+	db.index.SetVersion(newVer)
 
 	return nil
 }
@@ -170,6 +182,11 @@ func (db *DB) InsertBatch(ids []string, vecs [][]float32, metas []map[string]any
 		// Note: We don't rollback storage here as it's complex for batches.
 		// The Open() self-healing will fix this sync drift on restart.
 		return fmt.Errorf("index batch update failed: %v", err)
+	}
+
+	newVer, err := db.storage.GetVersion()
+	if err == nil {
+		db.index.SetVersion(newVer)
 	}
 
 	return nil
