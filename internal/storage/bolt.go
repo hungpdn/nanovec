@@ -96,6 +96,8 @@ func (s *BoltStorage) Put(doc *types.Document) (uint64, error) {
 		bDocs := tx.Bucket([]byte(bucketDocuments))
 		bMeta := tx.Bucket([]byte(bucketMeta))
 
+		isNew := bDocs.Get([]byte(doc.ID)) == nil
+
 		buf := bufferPool.Get().(*bytes.Buffer)
 		buf.Reset()
 		defer bufferPool.Put(buf)
@@ -108,10 +110,11 @@ func (s *BoltStorage) Put(doc *types.Document) (uint64, error) {
 			return err
 		}
 
-		count := uint64(bDocs.Stats().KeyN)
-		countBuf := make([]byte, 8)
-		binary.LittleEndian.PutUint64(countBuf, count)
-		_ = bMeta.Put([]byte(keyDocCount), countBuf)
+		if isNew {
+			if err := incrementCount(bMeta, 1); err != nil {
+				return err
+			}
+		}
 
 		var err error
 		newSeq, err = s.incVersion(tx)
@@ -153,18 +156,32 @@ func (s *BoltStorage) PutBatch(docs []*types.Document) (uint64, error) {
 		bMeta := tx.Bucket([]byte(bucketMeta))
 
 		allData := batchBuf.Bytes()
+		newItemsCount := int64(0)
+		seenInBatch := make(map[string]bool)
 
 		for _, r := range ranges {
+			idStr := string(r.id)
+			if seenInBatch[idStr] {
+				if err := bDocs.Put(r.id, allData[r.start:r.end]); err != nil {
+					return err
+				}
+				continue
+			}
+			seenInBatch[idStr] = true
+
+			if bDocs.Get(r.id) == nil {
+				newItemsCount++
+			}
+
 			if err := bDocs.Put(r.id, allData[r.start:r.end]); err != nil {
 				return err
 			}
 		}
 
-		count := uint64(bDocs.Stats().KeyN)
-		countBuf := make([]byte, 8)
-		binary.LittleEndian.PutUint64(countBuf, count)
-		if err := bMeta.Put([]byte(keyDocCount), countBuf); err != nil {
-			return err
+		if newItemsCount > 0 {
+			if err := incrementCount(bMeta, newItemsCount); err != nil {
+				return err
+			}
 		}
 
 		var err error
@@ -221,10 +238,9 @@ func (s *BoltStorage) Delete(id string) (uint64, error) {
 			return err
 		}
 
-		count := uint64(bDocs.Stats().KeyN)
-		countBuf := make([]byte, 8)
-		binary.LittleEndian.PutUint64(countBuf, count)
-		_ = bMeta.Put([]byte(keyDocCount), countBuf)
+		if err := incrementCount(bMeta, -1); err != nil {
+			return err
+		}
 
 		var err error
 		currentSeq, err = s.incVersion(tx)
@@ -302,8 +318,12 @@ var bufferPool = sync.Pool{
 // Format: [Dim(4b)][Vector(dim*4b)][JsonMetadata(...)]
 func serializeDocument(doc *types.Document, buf *bytes.Buffer) error {
 	dim := len(doc.Vector)
-	var scratch [4]byte
 
+	if dim > MaxAllowedDim {
+		return fmt.Errorf("vector dimension %d exceeds max allowed %d", dim, MaxAllowedDim)
+	}
+
+	var scratch [4]byte
 	binary.LittleEndian.PutUint32(scratch[:], uint32(dim))
 	buf.Write(scratch[:])
 
@@ -360,4 +380,20 @@ func deserializeDocument(id string, data []byte) (*types.Document, error) {
 		Vector:   vec,
 		Metadata: meta,
 	}, nil
+}
+
+// Helper to safely update the counter
+func incrementCount(b *bbolt.Bucket, delta int64) error {
+	count := uint64(0)
+	if val := b.Get([]byte(keyDocCount)); val != nil {
+		count = binary.LittleEndian.Uint64(val)
+	}
+	if delta < 0 && uint64(-delta) > count {
+		count = 0
+	} else {
+		count = uint64(int64(count) + delta)
+	}
+	buf := make([]byte, 8)
+	binary.LittleEndian.PutUint64(buf, count)
+	return b.Put([]byte(keyDocCount), buf)
 }
