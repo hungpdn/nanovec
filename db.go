@@ -9,6 +9,7 @@ import (
 	"github.com/hungpdn/nanovec/internal"
 	"github.com/hungpdn/nanovec/internal/storage"
 	"github.com/hungpdn/nanovec/pkg/errors"
+	"github.com/hungpdn/nanovec/pkg/maths"
 	"github.com/hungpdn/nanovec/pkg/types"
 )
 
@@ -19,6 +20,9 @@ type DB struct {
 	config  Config
 	index   internal.VectorIndex // Search engine (in RAM)
 	storage internal.Storage     // Storage engine (on disk)
+
+	// Reuse buffers for search queries to avoid allocation
+	searchBufPool *sync.Pool
 }
 
 // Open initializes the database
@@ -113,6 +117,11 @@ func Open(path string, cfg *Config) (*DB, error) {
 		config:  *cfg,
 		index:   idx,
 		storage: store,
+		searchBufPool: &sync.Pool{
+			New: func() any {
+				return make([]float32, cfg.Dimension)
+			},
+		},
 	}, nil
 }
 
@@ -188,7 +197,13 @@ func (db *DB) Search(query []float32, k int, filter types.FilterFunc) ([]types.S
 	if len(query) != db.config.Dimension {
 		return nil, errors.ErrQueryDimMismatch
 	}
-	return db.index.Search(types.Vector(query), k, filter)
+
+	buf := db.searchBufPool.Get().([]float32)
+	defer db.searchBufPool.Put(buf)
+	copy(buf, query)
+	maths.NormalizeInPlace(buf)
+
+	return db.index.Search(types.Vector(buf), k, filter)
 }
 
 // Update updates document

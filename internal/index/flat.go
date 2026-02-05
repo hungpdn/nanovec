@@ -129,13 +129,12 @@ func (idx *FlatIndex[T]) AddBatch(ids []string, vecs []types.Vector, metas []map
 }
 
 // Search finds k nearest neighbors.
+// Note: 'query' must be already normalized by the caller.
 func (idx *FlatIndex[T]) Search(query types.Vector, k int, filter types.FilterFunc) ([]types.SearchResult, error) {
 	idx.RLock()
 	defer idx.RUnlock()
 
-	normalizedQuery := make(types.Vector, len(query))
-	copy(normalizedQuery, query)
-	maths.NormalizeInPlace(normalizedQuery)
+	normalizedQuery := query
 
 	n := len(idx.IDs)
 	h := &ResultHeap{}

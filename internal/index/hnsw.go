@@ -311,6 +311,7 @@ func (idx *HNSWIndex[T]) addConnection(level, from, to int) {
 }
 
 // Search performs Approximate Nearest Neighbor search
+// Note: 'query' must be already normalized.
 func (idx *HNSWIndex[T]) Search(query types.Vector, k int, filter types.FilterFunc) ([]types.SearchResult, error) {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
@@ -319,9 +320,7 @@ func (idx *HNSWIndex[T]) Search(query types.Vector, k int, filter types.FilterFu
 		return []types.SearchResult{}, nil
 	}
 
-	normalizedQuery := make([]float32, len(query))
-	copy(normalizedQuery, query)
-	maths.NormalizeInPlace(normalizedQuery)
+	normalizedQuery := query
 
 	currObj := idx.enterPoint
 	currDist := idx.distQueryFunc(normalizedQuery, idx.nodes[currObj].Vec)
