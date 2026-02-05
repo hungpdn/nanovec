@@ -35,7 +35,7 @@ func Open(path string, cfg *Config) (*DB, error) {
 	indexPath := path + ".idx"
 	err = idx.Load(indexPath)
 	if err != nil {
-		// If load fails, we will rebuild, so just init a fresh index
+		// If load fails, we will rebuild
 		idx = cfg.GetVectorIndex()
 	}
 	indexLoaded := err == nil
@@ -56,9 +56,7 @@ func Open(path string, cfg *Config) (*DB, error) {
 		return nil, fmt.Errorf("failed to check storage integrity: %v", err)
 	}
 
-	// Self-Healing: rebuild if
-	// - Index failed to load
-	// - Counts mismatch (Sync Drift / Corruption)
+	// Self-Healing
 	if !indexLoaded || idx.Count() != storeCount {
 		reason := "Index missing or corrupt"
 		if indexLoaded && idx.Count() != storeCount {
@@ -67,7 +65,6 @@ func Open(path string, cfg *Config) (*DB, error) {
 
 		fmt.Printf("⚠️ %s. Rebuilding from Storage...\n", reason)
 
-		// Reset Index to clean state before rebuilding
 		if idx.Count() > 0 {
 			db.index = cfg.GetVectorIndex()
 		}
@@ -102,13 +99,13 @@ func Open(path string, cfg *Config) (*DB, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to rebuild index: %v", err)
 		}
-		fmt.Printf("✅ Restored %d vectors from storage (Batched).\n", count)
+		fmt.Printf("✅ Restored %d vectors from storage.\n", count)
 	}
 
 	return db, nil
 }
 
-// Insert adds or updates a vector (Upsert behavior)
+// Insert adds or updates a vector
 func (db *DB) Insert(id string, vec []float32, meta map[string]any) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -129,8 +126,9 @@ func (db *DB) Insert(id string, vec []float32, meta map[string]any) error {
 
 	_ = db.index.Delete(id)
 	if err := db.index.Add(id, types.Vector(vec), meta); err != nil {
+		// Rollback storage if index fails
 		_ = db.storage.Delete(id)
-		return fmt.Errorf("index add failed (rolled back storage): %v", err)
+		return fmt.Errorf("index add failed (rolled back): %v", err)
 	}
 
 	return nil
@@ -153,7 +151,6 @@ func (db *DB) InsertBatch(ids []string, vecs [][]float32, metas []map[string]any
 			return errors.ErrDimMismatch
 		}
 		typeVectors[i] = types.Vector(vecs[i])
-
 		docs[i] = &types.Document{
 			ID:       id,
 			Vector:   typeVectors[i],
@@ -186,11 +183,10 @@ func (db *DB) Search(query []float32, k int, filter types.FilterFunc) ([]types.S
 	if len(query) != db.config.Dimension {
 		return nil, errors.ErrQueryDimMismatch
 	}
-
 	return db.index.Search(types.Vector(query), k, filter)
 }
 
-// Update updates document. Delete-then-Insert in Index.
+// Update updates document
 func (db *DB) Update(id string, newVec []float32, newMeta map[string]any) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -208,7 +204,6 @@ func (db *DB) Update(id string, newVec []float32, newMeta map[string]any) error 
 	if len(newVec) > 0 {
 		finalVec = types.Vector(newVec)
 	}
-
 	finalMeta := oldDoc.Metadata
 	if newMeta != nil {
 		finalMeta = newMeta
@@ -226,9 +221,8 @@ func (db *DB) Update(id string, newVec []float32, newMeta map[string]any) error 
 
 	_ = db.index.Delete(id)
 	if err := db.index.Add(id, finalVec, finalMeta); err != nil {
-		// Attempt to restore old doc to storage
-		_ = db.storage.Put(oldDoc)
-		return fmt.Errorf("index update failed (rolled back storage): %v", err)
+		_ = db.storage.Put(oldDoc) // Rollback to old doc
+		return fmt.Errorf("index update failed: %v", err)
 	}
 
 	return nil
@@ -242,11 +236,9 @@ func (db *DB) Delete(id string) error {
 	if err := db.storage.Delete(id); err != nil {
 		return err
 	}
-
 	if err := db.index.Delete(id); err != nil {
 		return err
 	}
-
 	return nil
 }
 
@@ -266,6 +258,5 @@ func (db *DB) Close() error {
 	if err := db.index.Save(indexPath); err != nil {
 		return fmt.Errorf("failed to save index: %v", err)
 	}
-
 	return db.storage.Close()
 }
