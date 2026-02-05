@@ -13,12 +13,10 @@ func NormalizeInPlace(vec []float32) {
 	}
 	magnitude := float32(math.Sqrt(float64(sum)))
 
-	// Avoid dividing by zero
 	if magnitude < 1e-9 {
 		return
 	}
 
-	// Multiply by reciprocal is faster than division
 	invMag := 1.0 / magnitude
 	for i := range vec {
 		vec[i] *= invMag
@@ -26,9 +24,7 @@ func NormalizeInPlace(vec []float32) {
 }
 
 // Normalize transforms the vector to a length equal to 1.
-// It returns a new slice, leaving the original unchanged.
 func Normalize(vec []float32) []float32 {
-	// Create a copy to avoid modifying the input
 	out := make([]float32, len(vec))
 	copy(out, vec)
 	NormalizeInPlace(out)
@@ -36,23 +32,29 @@ func Normalize(vec []float32) []float32 {
 }
 
 // DotProduct calculates the dot product of two vectors.
-// This is the most frequently called function (Hot path).
+// Optimized with Loop Unrolling (4x) for SIMD auto-vectorization.
 func DotProduct(a, b []float32) float32 {
-	if len(a) != len(b) {
-		return 0
-	}
-	if len(a) == 0 {
+	if len(a) != len(b) || len(a) == 0 {
 		return 0
 	}
 
-	// OPTIMIZATION: Bounds Check Elimination
-	// Check the last element to prove to the compiler that the slice is long enough.
-	// This prevents bounds checks inside the loop.
+	// Bounds Check Elimination
 	_ = a[len(a)-1]
 	_ = b[len(a)-1]
 
 	var sum float32
-	for i := 0; i < len(a); i++ {
+	i := 0
+
+	// Unroll loop 4x to help compiler generate vector instructions
+	for ; i <= len(a)-4; i += 4 {
+		sum += a[i]*b[i] +
+			a[i+1]*b[i+1] +
+			a[i+2]*b[i+2] +
+			a[i+3]*b[i+3]
+	}
+
+	// Handle remaining elements
+	for ; i < len(a); i++ {
 		sum += a[i] * b[i]
 	}
 
