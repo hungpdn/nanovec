@@ -4,6 +4,7 @@ import (
 	"container/heap"
 	"encoding/binary"
 	"encoding/gob"
+	"fmt"
 	"os"
 	"slices"
 
@@ -125,6 +126,17 @@ func (idx *FlatIndex[T]) AddBatch(ids []string, vecs []types.Vector, metas []map
 		idx.AddMeta(id, metas[i])
 	}
 
+	return nil
+}
+
+func (idx *FlatIndex[T]) UpdateMetadata(id string, meta map[string]any) error {
+	idx.Lock()
+	defer idx.Unlock()
+
+	if _, exists := idx.idMap[id]; !exists {
+		return fmt.Errorf("id %s not found", id)
+	}
+	idx.Metadata[id] = meta
 	return nil
 }
 

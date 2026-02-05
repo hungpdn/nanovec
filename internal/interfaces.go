@@ -8,6 +8,7 @@ import (
 type VectorIndex interface {
 	Add(id string, vec types.Vector, meta map[string]any) error
 	AddBatch(ids []string, vecs []types.Vector, metas []map[string]any) error
+	UpdateMetadata(id string, meta map[string]any) error
 	Delete(id string) error
 	Search(vec types.Vector, k int, filter types.FilterFunc) ([]types.SearchResult, error)
 	Save(path string) error

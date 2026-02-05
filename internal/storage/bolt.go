@@ -28,7 +28,7 @@ type BoltStorage struct {
 func NewBoltStorage(path string) (*BoltStorage, error) {
 	db, err := bbolt.Open(path, 0600, &bbolt.Options{
 		Timeout:        1 * time.Second,
-		NoFreelistSync: true, // Improve write performance
+		NoFreelistSync: false, // Set false for reliability (prevent corruption on power loss)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("could not open bolt db: %v", err)
@@ -180,7 +180,18 @@ func (s *BoltStorage) Put(doc *types.Document) (uint64, error) {
 
 // PutBatch saves multiple documents AND returns the new Version
 func (s *BoltStorage) PutBatch(docs []*types.Document) (uint64, error) {
+	// 1. PRE-SERIALIZATION (Outside Lock) -> CPU bound
+	docData := make([][]byte, len(docs))
+	for i, doc := range docs {
+		data, err := serializeDocument(doc)
+		if err != nil {
+			return 0, err
+		}
+		docData[i] = data
+	}
+
 	var newSeq uint64
+	// 2. WRITE TRANSACTION (Inside Lock) -> IO bound
 	err := s.db.Update(func(tx *bbolt.Tx) error {
 		bDocs := tx.Bucket([]byte(bucketDocuments))
 		bMeta := tx.Bucket([]byte(bucketMeta))
@@ -190,7 +201,7 @@ func (s *BoltStorage) PutBatch(docs []*types.Document) (uint64, error) {
 		// Even if the input slice has ["A", "A"], we only count "A" as new once.
 		visited := make(map[string]bool, len(docs))
 
-		for _, doc := range docs {
+		for i, doc := range docs {
 			// Only check for "newness" if we haven't processed this ID in this batch yet.
 			// (Last Write Wins logic still applies for the Put itself, but we shouldn't increment count twice)
 			if !visited[doc.ID] {
@@ -200,12 +211,7 @@ func (s *BoltStorage) PutBatch(docs []*types.Document) (uint64, error) {
 				visited[doc.ID] = true
 			}
 
-			data, err := serializeDocument(doc)
-			if err != nil {
-				return err
-			}
-
-			if err := bDocs.Put([]byte(doc.ID), data); err != nil {
+			if err := bDocs.Put([]byte(doc.ID), docData[i]); err != nil {
 				return err
 			}
 		}

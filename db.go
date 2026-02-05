@@ -200,9 +200,9 @@ func (db *DB) InsertBatch(ids []string, vecs [][]float32, metas []map[string]any
 	}
 
 	if err := db.index.AddBatch(ids, typeVectors, metas); err != nil {
-		// Note: We don't rollback storage here as it's complex for batches.
 		// The Open() self-healing will fix this sync drift on restart.
-		return fmt.Errorf("index batch update failed: %v", err)
+		log.Printf("CRITICAL: Index corrupted during batch insert. Persistence requires restart. Error: %v", err)
+		panic("nanovec: memory index corrupted, restarting required to maintain consistency")
 	}
 
 	db.index.SetVersion(newVer)
@@ -256,9 +256,15 @@ func (db *DB) Update(id string, newVec []float32, newMeta map[string]any) error 
 		return err
 	}
 
-	_ = db.index.Delete(id)
-	if err := db.index.Add(id, finalVec, finalMeta); err != nil {
-		return fmt.Errorf("index update failed: %v", err)
+	if len(newVec) == 0 {
+		if err := db.index.UpdateMetadata(id, finalMeta); err != nil {
+			return fmt.Errorf("index metadata update failed: %v", err)
+		}
+	} else {
+		_ = db.index.Delete(id)
+		if err := db.index.Add(id, finalVec, finalMeta); err != nil {
+			return fmt.Errorf("index update failed: %v", err)
+		}
 	}
 
 	db.index.SetVersion(newVer)

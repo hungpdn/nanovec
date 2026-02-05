@@ -2,10 +2,12 @@ package index
 
 import (
 	"container/heap"
+	"encoding/binary"
 	"encoding/gob"
 	"fmt"
 	"math"
 	"os"
+	"slices"
 	"sync"
 
 	"github.com/hungpdn/nanovec/pkg/errors"
@@ -127,6 +129,7 @@ func (idx *HNSWIndex[T]) AddBatch(ids []string, vecs []types.Vector, metas []map
 		}
 	}
 
+	idx.nodes = slices.Grow(idx.nodes, len(ids))
 	scratch := make([]float32, idx.dim)
 
 	for i, id := range ids {
@@ -156,7 +159,7 @@ func (idx *HNSWIndex[T]) internalAdd(id string, vec types.Vector, meta map[strin
 	copy(navQuery, vec)
 	maths.NormalizeInPlace(navQuery)
 
-	storedVec := idx.convertFunc(vec)
+	storedVec := idx.convertFunc(navQuery)
 
 	level := searchCtx.randomLevel()
 	internalID := len(idx.nodes)
@@ -181,6 +184,7 @@ func (idx *HNSWIndex[T]) internalAdd(id string, vec types.Vector, meta map[strin
 	currObj := idx.enterPoint
 	currDist := idx.distQueryFunc(navQuery, idx.nodes[currObj].Vec)
 
+	// Greedy search
 	for l := idx.maxLevel; l > level; l-- {
 		changed := true
 		for changed {
@@ -205,8 +209,8 @@ func (idx *HNSWIndex[T]) internalAdd(id string, vec types.Vector, meta map[strin
 		neighbors := idx.selectNeighborsFromHeap(searchCtx, searchCtx.results, idx.M)
 
 		for _, neighborID := range neighbors {
-			idx.addConnection(l, internalID, neighborID)
-			idx.addConnection(l, neighborID, internalID)
+			idx.addConnection(searchCtx, l, internalID, neighborID)
+			idx.addConnection(searchCtx, l, neighborID, internalID)
 		}
 		// Update currObj to the closest found for next layer
 		if searchCtx.results.Len() > 0 {
@@ -233,6 +237,18 @@ func (idx *HNSWIndex[T]) internalAdd(id string, vec types.Vector, meta map[strin
 		idx.maxLevel = level
 		idx.enterPoint = internalID
 	}
+	return nil
+}
+
+// UpdateMetadata updates only the metadata for an ID (O(1))
+func (idx *HNSWIndex[T]) UpdateMetadata(id string, meta map[string]any) error {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	if _, exists := idx.idMap[id]; !exists {
+		return fmt.Errorf("id %s not found", id)
+	}
+	idx.Metadata[id] = meta
 	return nil
 }
 
@@ -302,7 +318,7 @@ func (idx *HNSWIndex[T]) searchLayer(ctx *searchCtx, query types.Vector, entryPo
 }
 
 // addConnection connects two nodes at a specific level, pruning if necessary
-func (idx *HNSWIndex[T]) addConnection(level, from, to int) {
+func (idx *HNSWIndex[T]) addConnection(ctx *searchCtx, level, from, to int) {
 	node := idx.nodes[from]
 	for _, neighbor := range node.Neighbors[level] {
 		if neighbor == to {
@@ -318,23 +334,40 @@ func (idx *HNSWIndex[T]) addConnection(level, from, to int) {
 
 	if len(node.Neighbors[level]) > maxM {
 		fromVec := idx.nodes[from].Vec
-		h := &MinHeap{}
-		heap.Init(h)
+
+		// REUSE HEAP from context
+		// We know ctx.results is a MinHeap. We clear it first just in case.
+		// (Though internalAdd flow usually clears it after usage, safety first)
+		h := ctx.results
+		*h = (*h)[:0] // Reset
 
 		for _, neighborID := range node.Neighbors[level] {
 			// Node to Node distance
 			score := idx.distNodeFunc(fromVec, idx.nodes[neighborID].Vec)
 			heap.Push(h, pqItem{id: neighborID, score: score})
+
+			// Keep only top maxM (Best scores).
+			// MinHeap pops the Lowest score.
+			// Wait: We want to KEEP the Highest scores (Best neighbors).
+			// If we use MinHeap, Pop() removes the WORST candidate.
+			// So if Len > maxM, Pop() removes the one with lowest similarity. Correct.
 			if h.Len() > maxM {
 				heap.Pop(h)
 			}
 		}
 
+		// Reconstruct neighbors list
+		// Reuse buffer for neighbors list?
+		// node.Neighbors[level] is the persistent storage, we must overwrite it.
+		// We can reuse the existing slice capacity if possible, but simpler to just alloc the small slice here.
 		newNeighbors := make([]int, h.Len())
 		for i := 0; i < len(newNeighbors); i++ {
 			newNeighbors[i] = (*h)[i].id
 		}
 		node.Neighbors[level] = newNeighbors
+
+		// Clean up heap for next use
+		*h = (*h)[:0]
 	}
 }
 
@@ -451,6 +484,13 @@ func (idx *HNSWIndex[T]) GetVersion() uint64 {
 // For serialization, we define a DTO to avoid exposing all internal fields if not needed,
 // but for simplicity in generics, we can export fields on Node[T] and use it directly.
 // In the code above, Node[T] fields are Exported.
+
+type nodeHeader struct {
+	ID        string
+	Level     int
+	Neighbors [][]int
+}
+
 func (idx *HNSWIndex[T]) Save(path string) error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
@@ -469,6 +509,15 @@ func (idx *HNSWIndex[T]) Save(path string) error {
 	if err := enc.Encode(idx.dim); err != nil {
 		return err
 	}
+	if err := enc.Encode(idx.M); err != nil {
+		return err
+	}
+	if err := enc.Encode(idx.EfConstruction); err != nil {
+		return err
+	}
+	if err := enc.Encode(idx.LevelMult); err != nil {
+		return err
+	}
 	if err := enc.Encode(idx.enterPoint); err != nil {
 		return err
 	}
@@ -482,8 +531,16 @@ func (idx *HNSWIndex[T]) Save(path string) error {
 	}
 
 	for _, node := range idx.nodes {
-		// Save node structure
-		if err := enc.Encode(node); err != nil {
+		header := nodeHeader{
+			ID:        node.ID,
+			Level:     node.Level,
+			Neighbors: node.Neighbors,
+		}
+		if err := enc.Encode(header); err != nil {
+			return err
+		}
+
+		if err := binary.Write(f, binary.LittleEndian, node.Vec); err != nil {
 			return err
 		}
 	}
@@ -518,6 +575,17 @@ func (idx *HNSWIndex[T]) Load(path string) error {
 	if err := dec.Decode(&idx.dim); err != nil {
 		return err
 	}
+	if err := dec.Decode(&idx.M); err != nil {
+		return err
+	}
+	idx.MMax0 = idx.M * 2
+	if err := dec.Decode(&idx.EfConstruction); err != nil {
+		return err
+	}
+	if err := dec.Decode(&idx.LevelMult); err != nil {
+		return err
+	}
+
 	if err := dec.Decode(&idx.enterPoint); err != nil {
 		return err
 	}
@@ -534,9 +602,21 @@ func (idx *HNSWIndex[T]) Load(path string) error {
 	idx.idMap = make(map[string]int)
 
 	for i := 0; i < count; i++ {
-		node := &Node[T]{}
-		if err := dec.Decode(node); err != nil {
+		var header nodeHeader
+		if err := dec.Decode(&header); err != nil {
 			return err
+		}
+
+		vec := make([]T, idx.dim)
+		if err := binary.Read(f, binary.LittleEndian, &vec); err != nil {
+			return err
+		}
+
+		node := &Node[T]{
+			ID:        header.ID,
+			Vec:       vec,
+			Level:     header.Level,
+			Neighbors: header.Neighbors,
 		}
 		idx.nodes[i] = node
 		idx.idMap[node.ID] = i
@@ -547,6 +627,7 @@ func (idx *HNSWIndex[T]) Load(path string) error {
 		return err
 	}
 
+	// Clean dead IDs
 	for id := range idx.idMap {
 		if _, isLive := idx.Metadata[id]; !isLive {
 			delete(idx.idMap, id)
