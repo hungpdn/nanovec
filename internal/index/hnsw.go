@@ -11,6 +11,7 @@ import (
 	"slices"
 	"sync"
 
+	"github.com/hungpdn/nanovec/pkg/bitset"
 	"github.com/hungpdn/nanovec/pkg/maths"
 	"github.com/hungpdn/nanovec/pkg/types"
 )
@@ -29,6 +30,7 @@ type HNSWIndex[T types.Number] struct {
 	// Graph State
 	nodes      []*Node[T]
 	idMap      map[string]int // External ID -> Internal Index
+	tombstones *bitset.BitSet // Bitset to mark deleted internal IDs (Ghost Nodes)
 	enterPoint int            // Internal Index of the entry node
 	maxLevel   int            // Current max level in the graph
 
@@ -69,6 +71,7 @@ func newHNSWIndex[T types.Number](dim, m, efConstruction int,
 		LevelMult:      1.0 / math.Log(float64(m)),
 		nodes:          make([]*Node[T], 0),
 		idMap:          make(map[string]int),
+		tombstones:     bitset.New(0),
 		Metadata:       make(map[string]map[string]any),
 		enterPoint:     -1,
 		maxLevel:       -1,
@@ -137,6 +140,7 @@ func (idx *HNSWIndex[T]) Add(id string, vec types.Vector, meta map[string]any) e
 
 	// Update Global State
 	internalID := len(idx.nodes)
+	idx.tombstones.Grow(internalID + 1)
 	idx.nodes = append(idx.nodes, node)
 	idx.idMap[id] = internalID
 	idx.Metadata[id] = meta
@@ -174,6 +178,7 @@ func (idx *HNSWIndex[T]) AddBatch(ids []string, vecs []types.Vector, metas []map
 
 	startIdx := len(idx.nodes)
 	count := len(ids)
+	idx.tombstones.Grow(startIdx + count)
 	idx.nodes = slices.Grow(idx.nodes, count)
 
 	rngCtx := idx.searchCtxPool.Get().(*searchCtx)
@@ -510,12 +515,12 @@ func (idx *HNSWIndex[T]) Search(query types.Vector, k int, filter types.FilterFu
 
 	results := make([]types.SearchResult, 0, k)
 	for _, c := range finalCandidates {
-		id := idx.nodes[c.id].ID
 
-		currentInternalID, exists := idx.idMap[id]
-		if !exists || currentInternalID != c.id {
+		if idx.tombstones.IsSet(c.id) {
 			continue
 		}
+
+		id := idx.nodes[c.id].ID
 
 		meta := idx.Metadata[id]
 		if filter != nil {
@@ -540,10 +545,13 @@ func (idx *HNSWIndex[T]) Search(query types.Vector, k int, filter types.FilterFu
 func (idx *HNSWIndex[T]) Delete(id string) error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
-	if _, ok := idx.idMap[id]; ok {
-		delete(idx.idMap, id)
-		delete(idx.Metadata, id)
+	internalID, exists := idx.idMap[id]
+	if !exists {
+		return nil
 	}
+	idx.tombstones.Set(internalID) // Soft Delete
+	delete(idx.idMap, id)
+	delete(idx.Metadata, id)
 	return nil
 }
 
@@ -650,6 +658,18 @@ func (idx *HNSWIndex[T]) Save(path string) error {
 	}
 
 	if err := enc.Encode(idx.Metadata); err != nil {
+		return err
+	}
+
+	// Save Tombstones (BitSet)
+	// Format: [Size(4b)] [DataLen(4b)] [Data([]uint64)]
+	if err := binary.Write(f, binary.LittleEndian, int32(idx.tombstones.Size)); err != nil {
+		return err
+	}
+	if err := binary.Write(f, binary.LittleEndian, int32(len(idx.tombstones.Data))); err != nil {
+		return err
+	}
+	if err := binary.Write(f, binary.LittleEndian, idx.tombstones.Data); err != nil {
 		return err
 	}
 
@@ -808,6 +828,27 @@ func (idx *HNSWIndex[T]) Load(path string) error {
 	idx.Metadata = make(map[string]map[string]any)
 	if err := dec.Decode(&idx.Metadata); err != nil {
 		return err
+	}
+
+	// Load Tombstones
+	var tsSize int32
+	if err := binary.Read(f, binary.LittleEndian, &tsSize); err != nil {
+		return err
+	}
+
+	var tsDataLen int32
+	if err := binary.Read(f, binary.LittleEndian, &tsDataLen); err != nil {
+		return err
+	}
+
+	tsData := make([]uint64, tsDataLen)
+	if err := binary.Read(f, binary.LittleEndian, &tsData); err != nil {
+		return err
+	}
+
+	idx.tombstones = &bitset.BitSet{
+		Size: int(tsSize),
+		Data: tsData,
 	}
 
 	// Clean dead IDs
