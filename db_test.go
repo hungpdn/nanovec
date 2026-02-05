@@ -102,3 +102,60 @@ func TestCrashRecovery(t *testing.T) {
 		t.Error("doc2 should exist after recovery")
 	}
 }
+
+func TestHNSWIndex(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "hnsw_test")
+
+	// Configure for HNSW
+	cfg := &nanovec.Config{
+		Dimension:      3,
+		IndexType:      nanovec.IndexTypeHNSW, // <--- Switch to HNSW
+		M:              16,
+		EfConstruction: 100,
+	}
+
+	// 1. Insert & Search
+	func() {
+		db, err := nanovec.Open(dbPath, cfg)
+		assertNoError(t, err, "Open HNSW DB")
+		defer db.Close()
+
+		// Insert vectors that are clearly distinct
+		// Vec A: [1, 0, 0]
+		// Vec B: [0, 1, 0]
+		err = db.Insert("vecA", []float32{1, 0, 0}, map[string]any{"type": "A"})
+		assertNoError(t, err, "Insert A")
+		err = db.Insert("vecB", []float32{0, 1, 0}, map[string]any{"type": "B"})
+		assertNoError(t, err, "Insert B")
+
+		// Search for A (Exact match)
+		results, err := db.Search([]float32{1, 0, 0}, 5, nil)
+		assertNoError(t, err, "Search A")
+
+		if len(results) == 0 {
+			t.Fatal("HNSW returned 0 results")
+		}
+		assertEqual(t, "vecA", results[0].ID, "Should find vecA first")
+		if results[0].Score < 0.99 {
+			t.Errorf("Score too low for exact match: %f", results[0].Score)
+		}
+	}()
+
+	// 2. Persistence & Recovery
+	func() {
+		// Re-open (simulating restart)
+		db, err := nanovec.Open(dbPath, cfg)
+		assertNoError(t, err, "Re-Open HNSW DB")
+		defer db.Close()
+
+		// Verify data persisted
+		results, err := db.Search([]float32{0, 1, 0}, 5, nil) // Search for B
+		assertNoError(t, err, "Search B after restart")
+
+		if len(results) == 0 {
+			t.Fatal("HNSW persistence failed (0 results)")
+		}
+		assertEqual(t, "vecB", results[0].ID, "Should find vecB after restart")
+	}()
+}
